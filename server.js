@@ -38,26 +38,36 @@ function isStaticAsset(requestPath) {
   return STATIC_ASSET_PATTERNS.some(pattern => pattern.test(requestPath));
 }
 
-// =============================================================================
-// BLOCKED BOT PATTERNS
-// Add new patterns here to expand blocking
-// =============================================================================
-
 const BLOCKED_BOTS = [
-  // Chinese bots
-  { pattern: /AliyunSecBot/i, reason: 'Chinese security scanner bot' },
-  { pattern: /PetalBot/i, reason: 'Huawei search engine bot' },
+    // =========================================================================
+    // KNOWN BAD BOTS (by name - always safe)
+    // =========================================================================
+    { pattern: /AliyunSecBot/i, reason: 'Chinese security scanner bot' },
+    { pattern: /PetalBot/i, reason: 'Huawei search engine bot' },
+    { pattern: /SemrushBot/i, reason: 'SEO scraper bot' },
+    { pattern: /AhrefsBot/i, reason: 'SEO scraper bot' },
+    { pattern: /DotBot/i, reason: 'SEO scraper bot' },
+    { pattern: /MJ12bot/i, reason: 'SEO scraper bot' },
 
-  // SEO scrapers
-  { pattern: /SemrushBot/i, reason: 'SEO scraper bot' },
-  { pattern: /AhrefsBot/i, reason: 'SEO scraper bot' },
-  { pattern: /DotBot/i, reason: 'SEO scraper bot' },
-  { pattern: /MJ12bot/i, reason: 'SEO scraper bot' },
+    // =========================================================================
+    // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
+    // =========================================================================
 
-  // Impossible browser combinations (spoofed user agents)
-  // { pattern: /Windows NT 6\.1.*Chrome\/12[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 120+' },
-  // { pattern: /Windows NT 6\.1.*Chrome\/13[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 130+' },
-  // { pattern: /Windows NT 6\.1.*Chrome\/14[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 140+' },
+    // Windows 7 (NT 6.1) + Chrome 110+ is impossible
+    // Chrome 109 was the LAST version supporting Windows 7 (February 2023)
+    // Source: Google officially ended support
+    { pattern: /Windows NT 6\.1.*Chrome\/1[1-9][0-9]\./i, reason: 'Impossible: Windows 7 + Chrome 110+ (support ended Feb 2023)' },
+    { pattern: /Windows NT 6\.1.*Chrome\/[2-9][0-9]{2}\./i, reason: 'Impossible: Windows 7 + Chrome 200+' },
+
+    // Windows Vista (NT 6.0) + Chrome 50+ is impossible
+    // Chrome 49 was the LAST version supporting Vista (April 2016)
+    { pattern: /Windows NT 6\.0.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows Vista + Chrome 50+' },
+    { pattern: /Windows NT 6\.0.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows Vista + Chrome 100+' },
+
+    // Windows XP (NT 5.1) + Chrome 50+ is impossible
+    // Chrome 49 was the LAST version supporting XP (April 2016)
+    { pattern: /Windows NT 5\.1.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows XP + Chrome 50+' },
+    { pattern: /Windows NT 5\.1.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows XP + Chrome 100+' },
 ];
 
 // =============================================================================
