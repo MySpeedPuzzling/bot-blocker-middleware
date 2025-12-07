@@ -55,11 +55,9 @@ const BLOCKED_BOTS = [
   { pattern: /MJ12bot/i, reason: 'SEO scraper bot' },
 
   // Impossible browser combinations (spoofed user agents)
-  { pattern: /Windows NT 6\.1.*Chrome\/12[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 120+' },
-  { pattern: /Windows NT 6\.1.*Chrome\/13[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 130+' },
-  { pattern: /Windows NT 6\.1.*Chrome\/14[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 140+' },
-  { pattern: /iPad; CPU iPad OS 1_/i, reason: 'Impossible browser: iPad OS 1.x does not exist' },
-  { pattern: /iPhone OS 26_/i, reason: 'Impossible browser: iOS 26 does not exist' },
+  // { pattern: /Windows NT 6\.1.*Chrome\/12[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 120+' },
+  // { pattern: /Windows NT 6\.1.*Chrome\/13[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 130+' },
+  // { pattern: /Windows NT 6\.1.*Chrome\/14[0-9]/i, reason: 'Impossible browser: Windows 7 + Chrome 140+' },
 ];
 
 // =============================================================================
