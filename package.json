@@ -1,0 +1,12 @@
+{
+  "name": "bot-blocker-middleware",
+  "version": "1.0.0",
+  "description": "Traefik ForwardAuth middleware for blocking bots and rate limiting",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
