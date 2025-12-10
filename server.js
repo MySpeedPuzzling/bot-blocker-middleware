@@ -38,6 +38,22 @@ function isStaticAsset(requestPath) {
   return STATIC_ASSET_PATTERNS.some(pattern => pattern.test(requestPath));
 }
 
+// =============================================================================
+// BLOCKED PATHS (immediate block for suspicious/malicious requests)
+// =============================================================================
+
+const BLOCKED_PATHS = [
+    { pattern: /\/wp-content\//i, reason: 'WordPress exploit attempt' },
+    { pattern: /\/wp-admin/i, reason: 'WordPress exploit attempt' },
+    { pattern: /\/wp-includes\//i, reason: 'WordPress exploit attempt' },
+    { pattern: /\/\.env/i, reason: 'Environment file access attempt' },
+    { pattern: /\/\.git/i, reason: 'Git repository access attempt' },
+];
+
+// =============================================================================
+// BLOCKED BOTS
+// =============================================================================
+
 const BLOCKED_BOTS = [
     // =========================================================================
     // KNOWN BAD BOTS (by name - always safe)
@@ -48,6 +64,13 @@ const BLOCKED_BOTS = [
     { pattern: /AhrefsBot/i, reason: 'SEO scraper bot' },
     { pattern: /DotBot/i, reason: 'SEO scraper bot' },
     { pattern: /MJ12bot/i, reason: 'SEO scraper bot' },
+    { pattern: /SERankingBacklinksBot/i, reason: 'SEO scraper bot (SE Ranking)' },
+    { pattern: /Bytespider|TikTokSpider/i, reason: 'TikTok content scraper' },
+    { pattern: /AwarioSmartBot/i, reason: 'Social monitoring bot' },
+    { pattern: /BrightEdge Crawler/i, reason: 'SEO crawler' },
+    { pattern: /GPTBot/i, reason: 'OpenAI training crawler' },
+    { pattern: /ClaudeBot/i, reason: 'Anthropic training crawler' },
+    { pattern: /Amazonbot/i, reason: 'Amazon Alexa indexer' },
 
     // =========================================================================
     // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
@@ -374,6 +397,22 @@ const server = http.createServer((req, res) => {
     res.writeHead(200);
     res.end('OK');
     return;
+  }
+
+  // Check blocked paths
+  for (const { pattern, reason } of BLOCKED_PATHS) {
+    if (pattern.test(requestPath)) {
+      logBlocked('path', ip, userAgent, reason, requestPath);
+
+      const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+
+      res.writeHead(403, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'X-Blocked-Reason': reason,
+      });
+      res.end(html);
+      return;
+    }
   }
 
   // Check blocked bots
