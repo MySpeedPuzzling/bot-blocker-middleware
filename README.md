@@ -4,7 +4,7 @@ Traefik ForwardAuth middleware for blocking bots and rate limiting requests.
 
 ## Features
 
-- Rate limiting (30 req/min per IP by default)
+- Rate limiting (45 req/min per IP by default)
 - Bot detection via user agent patterns
 - Static assets excluded from rate limiting
 - Daily log rotation with summaries
@@ -20,7 +20,7 @@ services:
     image: ghcr.io/myspeedpuzzling/bot-blocker-middleware:latest
     restart: always
     environment:
-      - RATE_LIMIT=30
+      - RATE_LIMIT=45
       - CONTACT_EMAIL=your@email.com
     volumes:
       - ./bot-blocker-logs:/var/log/bot-blocker
@@ -50,12 +50,12 @@ labels:
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3000` | Server port |
-| `RATE_LIMIT` | `30` | Max requests per window |
-| `RATE_WINDOW` | `60000` | Window size in ms (1 min) |
-| `CONTACT_EMAIL` | `j.mikes@me.com` | Contact email on block pages |
+| Variable | Default                | Description |
+|----------|------------------------|-------------|
+| `PORT` | `3000`                 | Server port |
+| `RATE_LIMIT` | `45`                   | Max requests per window |
+| `RATE_WINDOW` | `60000`                | Window size in ms (1 min) |
+| `CONTACT_EMAIL` | `j.mikes@me.com`       | Contact email on block pages |
 | `LOG_DIR` | `/var/log/bot-blocker` | Log directory |
 
 ## Adding New Bot Patterns

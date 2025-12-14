@@ -9,7 +9,7 @@ const path = require('path');
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'j.mikes@me.com';
 const LOG_DIR = process.env.LOG_DIR || '/var/log/bot-blocker';
 const PORT = process.env.PORT || 3000;
-const RATE_LIMIT = parseInt(process.env.RATE_LIMIT, 10) || 30;
+const RATE_LIMIT = parseInt(process.env.RATE_LIMIT, 10) || 45;
 const RATE_WINDOW = parseInt(process.env.RATE_WINDOW, 10) || 60 * 1000; // 1 minute
 
 // =============================================================================
