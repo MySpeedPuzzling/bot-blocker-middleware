@@ -12,6 +12,13 @@ const PORT = process.env.PORT || 3000;
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT, 10) || 45;
 const RATE_WINDOW = parseInt(process.env.RATE_WINDOW, 10) || 60 * 1000; // 1 minute
 
+// Locale scraping detection
+const LOCALE_THRESHOLD = parseInt(process.env.LOCALE_THRESHOLD, 10) || 4;       // unique locales
+const LOCALE_MIN_HITS = parseInt(process.env.LOCALE_MIN_HITS, 10) || 3;         // requests per locale
+const LOCALE_WINDOW = parseInt(process.env.LOCALE_WINDOW, 10) || 60000;         // 1 minute
+const BAN_DURATION = parseInt(process.env.BAN_DURATION, 10) || 30 * 24 * 60 * 60 * 1000; // 30 days
+const BANNED_IPS_FILE = path.join(LOG_DIR, 'banned-ips.json');
+
 // =============================================================================
 // STATIC ASSET PATTERNS (excluded from rate limiting)
 // =============================================================================
@@ -196,6 +203,133 @@ function scheduleNextSummary() {
 
 const requests = new Map();
 
+// =============================================================================
+// PERMANENT BAN TRACKING
+// =============================================================================
+
+const bannedIPs = new Map();  // ip -> { bannedAt, reason, locales }
+
+function loadBannedIPs() {
+  try {
+    if (fs.existsSync(BANNED_IPS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(BANNED_IPS_FILE, 'utf8'));
+      const now = Date.now();
+
+      for (const [ip, info] of Object.entries(data)) {
+        const bannedAt = new Date(info.bannedAt).getTime();
+        // Skip expired bans
+        if (now - bannedAt < BAN_DURATION) {
+          bannedIPs.set(ip, info);
+        }
+      }
+      console.log(`[BAN] Loaded ${bannedIPs.size} active bans from file`);
+    }
+  } catch (err) {
+    console.error('[BAN] Failed to load banned IPs:', err.message);
+  }
+}
+
+function saveBannedIPs() {
+  try {
+    const data = Object.fromEntries(bannedIPs);
+    fs.writeFileSync(BANNED_IPS_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('[BAN] Failed to save banned IPs:', err.message);
+  }
+}
+
+function banIP(ip, reason, locales) {
+  const info = {
+    bannedAt: new Date().toISOString(),
+    reason,
+    locales: Array.from(locales)
+  };
+  bannedIPs.set(ip, info);
+  saveBannedIPs();
+  console.log(`[BAN] Permanently banned ${ip}: ${reason}`);
+}
+
+function isPermanentlyBanned(ip) {
+  if (!bannedIPs.has(ip)) return false;
+
+  const info = bannedIPs.get(ip);
+  const bannedAt = new Date(info.bannedAt).getTime();
+
+  // Check if ban has expired
+  if (Date.now() - bannedAt >= BAN_DURATION) {
+    bannedIPs.delete(ip);
+    saveBannedIPs();
+    console.log(`[BAN] Ban expired for ${ip}`);
+    return false;
+  }
+
+  return true;
+}
+
+// =============================================================================
+// LOCALE SWITCHING DETECTION
+// =============================================================================
+
+const localeTracker = new Map();  // ip -> { localeCounts: Map<locale, count>, windowStart }
+
+function extractLocale(requestPath) {
+  const match = requestPath.match(/^\/(en|de|fr|es|ja)\//i);
+  return match ? match[1].toLowerCase() : null;
+}
+
+function checkLocaleSwitch(ip, requestPath) {
+  const locale = extractLocale(requestPath);
+  if (!locale) return false;  // Not a locale path
+
+  const now = Date.now();
+
+  if (!localeTracker.has(ip)) {
+    const localeCounts = new Map();
+    localeCounts.set(locale, 1);
+    localeTracker.set(ip, { localeCounts, windowStart: now });
+    return false;
+  }
+
+  const record = localeTracker.get(ip);
+
+  // Reset window if expired
+  if (now - record.windowStart > LOCALE_WINDOW) {
+    record.localeCounts = new Map([[locale, 1]]);
+    record.windowStart = now;
+    return false;
+  }
+
+  // Increment count for this locale
+  const currentCount = record.localeCounts.get(locale) || 0;
+  record.localeCounts.set(locale, currentCount + 1);
+
+  // Count locales with LOCALE_MIN_HITS+ hits
+  const qualifyingLocales = [];
+  for (const [loc, count] of record.localeCounts) {
+    if (count >= LOCALE_MIN_HITS) {
+      qualifyingLocales.push(loc);
+    }
+  }
+
+  // Check threshold: LOCALE_THRESHOLD+ locales each with LOCALE_MIN_HITS+ requests
+  if (qualifyingLocales.length >= LOCALE_THRESHOLD) {
+    const elapsed = Math.round((now - record.windowStart) / 1000);
+    const details = qualifyingLocales.map(loc =>
+      `${loc}(${record.localeCounts.get(loc)})`
+    ).join(', ');
+    const reason = `Locale scraping detected: ${details} in ${elapsed}s`;
+    banIP(ip, reason, qualifyingLocales);
+    localeTracker.delete(ip);
+    return true;  // Trigger ban
+  }
+
+  return false;
+}
+
+// =============================================================================
+// RATE LIMITING
+// =============================================================================
+
 function isRateLimited(ip) {
   const now = Date.now();
 
@@ -216,12 +350,21 @@ function isRateLimited(ip) {
   return record.count > RATE_LIMIT;
 }
 
-// Cleanup old rate limit records every 5 minutes
+// Cleanup old records every 5 minutes
 setInterval(() => {
   const now = Date.now();
+
+  // Clean rate limit records
   for (const [key, record] of requests) {
     if (now - record.windowStart > RATE_WINDOW * 2) {
       requests.delete(key);
+    }
+  }
+
+  // Clean locale tracker records
+  for (const [key, record] of localeTracker) {
+    if (now - record.windowStart > LOCALE_WINDOW * 2) {
+      localeTracker.delete(key);
     }
   }
 }, 5 * 60 * 1000);
@@ -399,6 +542,22 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Check permanent ban
+  if (isPermanentlyBanned(ip)) {
+    const info = bannedIPs.get(ip);
+    logBlocked('permaban', ip, userAgent, info.reason, requestPath);
+
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g,
+      `Permanently banned: ${info.reason}`);
+
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'permaban',
+    });
+    res.end(html);
+    return;
+  }
+
   // Check blocked paths
   for (const { pattern, reason } of BLOCKED_PATHS) {
     if (pattern.test(requestPath)) {
@@ -431,6 +590,21 @@ const server = http.createServer((req, res) => {
     }
   }
 
+  // Check locale switching (may trigger permanent ban)
+  if (checkLocaleSwitch(ip, requestPath)) {
+    const info = bannedIPs.get(ip);
+    logBlocked('locale_switch', ip, userAgent, info.reason, requestPath);
+
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, info.reason);
+
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'locale_switch',
+    });
+    res.end(html);
+    return;
+  }
+
   // Check rate limit
   if (isRateLimited(ip)) {
     logBlocked('rate_limit', ip, userAgent, 'Too many requests', requestPath);
@@ -454,10 +628,13 @@ const server = http.createServer((req, res) => {
 // =============================================================================
 
 ensureLogDir();
+loadBannedIPs();
 
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
+  console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
+  console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
   console.log(`Static asset patterns: ${STATIC_ASSET_PATTERNS.length}`);
   console.log(`Log directory: ${LOG_DIR}`);

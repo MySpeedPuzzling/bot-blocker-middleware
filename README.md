@@ -6,6 +6,8 @@ Traefik ForwardAuth middleware for blocking bots and rate limiting requests.
 
 - Rate limiting (45 req/min per IP by default)
 - Bot detection via user agent patterns
+- Locale scraping detection (auto-bans IPs switching locales rapidly)
+- Permanent IP banning with 30-day expiry
 - Static assets excluded from rate limiting
 - Daily log rotation with summaries
 - User-friendly block pages
@@ -55,6 +57,10 @@ labels:
 | `PORT` | `3000`                 | Server port |
 | `RATE_LIMIT` | `45`                   | Max requests per window |
 | `RATE_WINDOW` | `60000`                | Window size in ms (1 min) |
+| `LOCALE_THRESHOLD` | `4`                    | Unique locales to trigger ban |
+| `LOCALE_MIN_HITS` | `3`                    | Min requests per locale |
+| `LOCALE_WINDOW` | `60000`                | Detection window in ms |
+| `BAN_DURATION` | `2592000000`           | Ban duration in ms (30 days) |
 | `CONTACT_EMAIL` | `j.mikes@me.com`       | Contact email on block pages |
 | `LOG_DIR` | `/var/log/bot-blocker` | Log directory |
 
@@ -69,12 +75,21 @@ const BLOCKED_BOTS = [
 ];
 ```
 
+## Locale Scraping Detection
+
+Automatically bans IPs that access multiple locale paths rapidly (e.g., scraping `/en/`, `/de/`, `/fr/`, `/es/`, `/ja/` versions).
+
+**Trigger:** 4+ unique locales with 3+ requests each within 60 seconds = 30-day ban
+
+**Persistence:** Banned IPs stored in `banned-ips.json` (survives restarts)
+
 ## Log Files
 
 ```
 /var/log/bot-blocker/
 ├── blocked-2025-12-07.log    # Daily JSON logs
-└── summary-2025-12-06.txt    # Auto-generated summaries
+├── summary-2025-12-06.txt    # Auto-generated summaries
+└── banned-ips.json           # Persistent IP bans
 ```
 
 View logs:
