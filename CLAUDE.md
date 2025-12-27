@@ -23,14 +23,20 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 2. Permanent ban check → immediate 403 for banned IPs
 3. Blocked path check → immediate 403 for WordPress exploits, `.env`, `.git` access
 4. Bot detection → 403 for known bad user agents (SEO bots, AI crawlers, impossible browser combos)
-5. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
-6. Rate limiting → 429 if IP exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
-7. Allow → 200 OK
+5. CIDR subnet check → 403 for known malicious IP ranges (43.104.33.0/24, 43.173.168.0/21)
+6. Chinese botnet check → 403 for 43.x IPs + HTTP/1.1 + outdated Chrome (100-139)
+7. Fake iOS bot check → 403 for 43.x IPs with iPhone OS 13_2_3
+8. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
+9. Rate limiting → 429 if IP exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
+10. Allow → 200 OK
 
 **Key data structures in `server.js`:**
 - `STATIC_ASSET_PATTERNS` - regex array for paths excluded from rate limiting
 - `BLOCKED_PATHS` - objects with `pattern` and `reason` for malicious path detection
 - `BLOCKED_BOTS` - objects with `pattern` and `reason` for user agent blocking
+- `BLOCKED_CIDRS` - objects with `prefix` and `reason` for subnet blocking
+- `isChineseBotnet()` - detects 43.x + HTTP/1.1 + outdated Chrome combo
+- `isFakeIOSBot()` - detects 43.x + ancient iOS user agents
 - `requests` Map - in-memory rate limit tracking per IP
 - `bannedIPs` Map - persisted permanent bans (loaded from `banned-ips.json`)
 - `localeTracker` Map - in-memory locale switching detection per IP
@@ -45,6 +51,13 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 Add entries to the `BLOCKED_BOTS` array:
 ```javascript
 { pattern: /BotName/i, reason: 'Description' }
+```
+
+## Adding Blocked Subnets
+
+Add entries to the `BLOCKED_CIDRS` array (uses prefix matching, no external dependencies):
+```javascript
+{ prefix: '43.104.33.', reason: 'Known botnet subnet' }
 ```
 
 ## Environment Variables

@@ -6,6 +6,8 @@ Traefik ForwardAuth middleware for blocking bots and rate limiting requests.
 
 - Rate limiting (60 req/min per IP by default)
 - Bot detection via user agent patterns
+- Chinese botnet detection (IP + HTTP version + outdated browser combo)
+- CIDR subnet blocking for known malicious IP ranges
 - Locale scraping detection (auto-bans IPs switching locales rapidly)
 - Permanent IP banning with 30-day expiry
 - Static assets excluded from rate limiting
@@ -74,6 +76,19 @@ const BLOCKED_BOTS = [
   // ... existing patterns
 ];
 ```
+
+## Chinese Botnet Detection
+
+Blocks distributed botnets from Chinese cloud providers (Alibaba, Tencent) that evade per-IP rate limiting by rotating through hundreds of IPs.
+
+**Detection methods:**
+
+1. **CIDR blocklist** - Known malicious subnets (43.104.33.0/24, 43.173.168.0/21)
+2. **Combination detection** - Blocks requests matching ALL of:
+   - IP starts with `43.`
+   - HTTP/1.1 protocol (bots don't use HTTP/2)
+   - Windows 10 + Chrome 100-139 (outdated versions)
+3. **Fake iOS detection** - Blocks 43.x IPs with ancient iOS 13.2.3 user agents
 
 ## Locale Scraping Detection
 
