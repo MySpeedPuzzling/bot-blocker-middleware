@@ -78,6 +78,7 @@ const BLOCKED_BOTS = [
     { pattern: /GPTBot/i, reason: 'OpenAI training crawler' },
     { pattern: /ClaudeBot/i, reason: 'Anthropic training crawler' },
     { pattern: /Amazonbot/i, reason: 'Amazon Alexa indexer' },
+    { pattern: /Barkrowler/i, reason: 'SEO crawler bot (Barkrowler)' },
 
     // =========================================================================
     // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
@@ -99,6 +100,57 @@ const BLOCKED_BOTS = [
     { pattern: /Windows NT 5\.1.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows XP + Chrome 50+' },
     { pattern: /Windows NT 5\.1.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows XP + Chrome 100+' },
 ];
+
+// =============================================================================
+// CIDR BLOCKLIST (known botnet subnets)
+// =============================================================================
+
+const BLOCKED_CIDRS = [
+  { prefix: '43.104.33.', reason: 'Known Chinese botnet subnet' },
+  // 43.173.168.0/21 covers 43.173.168-175.x
+  { prefix: '43.173.168.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.169.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.170.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.171.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.172.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.173.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.174.', reason: 'Known Chinese botnet subnet' },
+  { prefix: '43.173.175.', reason: 'Known Chinese botnet subnet' },
+];
+
+function isBlockedSubnet(ip) {
+  if (!ip) return null;
+  for (const cidr of BLOCKED_CIDRS) {
+    if (ip.startsWith(cidr.prefix)) {
+      return cidr.reason;
+    }
+  }
+  return null;
+}
+
+// =============================================================================
+// CHINESE BOTNET DETECTION (combination-based)
+// =============================================================================
+
+/**
+ * Detects Chinese botnet based on combination of IP, protocol, and user agent
+ * Pattern: 43.x IP + HTTP/1.1 + Windows 10 + Chrome 100-139
+ */
+function isChineseBotnet(ip, userAgent, httpVersion) {
+  if (!ip || !ip.startsWith('43.')) return false;
+  if (httpVersion !== '1.1') return false;
+  const botPattern = /Windows NT 10\.0.*Chrome\/(10[0-9]|11[0-9]|12[0-9]|13[0-9])\./;
+  return botPattern.test(userAgent || '');
+}
+
+/**
+ * Detects fake iOS bot from Chinese cloud
+ * iOS 13.2.3 is from November 2019 - no real user has this in 2025
+ */
+function isFakeIOSBot(ip, userAgent) {
+  if (!ip || !ip.startsWith('43.')) return false;
+  return /iPhone OS 13_2_3/.test(userAgent || '');
+}
 
 // =============================================================================
 // LOGGING WITH DAILY ROTATION
@@ -590,6 +642,45 @@ const server = http.createServer((req, res) => {
     }
   }
 
+  // Check blocked subnets (known botnet IPs)
+  const subnetBlock = isBlockedSubnet(ip);
+  if (subnetBlock) {
+    logBlocked('subnet', ip, userAgent, subnetBlock, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, subnetBlock);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'blocked_subnet',
+    });
+    res.end(html);
+    return;
+  }
+
+  // Check Chinese botnet (combination detection)
+  if (isChineseBotnet(ip, userAgent, req.httpVersion)) {
+    const reason = 'Chinese cloud botnet (43.x + HTTP/1.1 + outdated Chrome)';
+    logBlocked('botnet', ip, userAgent, reason, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'chinese_botnet',
+    });
+    res.end(html);
+    return;
+  }
+
+  // Check fake iOS bot from Chinese cloud
+  if (isFakeIOSBot(ip, userAgent)) {
+    const reason = 'Fake iOS bot from Chinese cloud';
+    logBlocked('botnet', ip, userAgent, reason, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'fake_ios_bot',
+    });
+    res.end(html);
+    return;
+  }
+
   // Check locale switching (may trigger permanent ban)
   if (checkLocaleSwitch(ip, requestPath)) {
     const info = bannedIPs.get(ip);
@@ -636,6 +727,7 @@ server.listen(PORT, () => {
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
+  console.log(`Blocked CIDR subnets: ${BLOCKED_CIDRS.length}`);
   console.log(`Static asset patterns: ${STATIC_ASSET_PATTERNS.length}`);
   console.log(`Log directory: ${LOG_DIR}`);
   console.log(`Contact email: ${CONTACT_EMAIL}`);
