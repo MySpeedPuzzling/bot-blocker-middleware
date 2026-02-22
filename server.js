@@ -46,6 +46,53 @@ function isStaticAsset(requestPath) {
 }
 
 // =============================================================================
+// SEARCH ENGINE BOT WHITELIST (bypass all blocking)
+// =============================================================================
+
+const WHITELISTED_BOTS = [
+  // Google (https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers)
+  { pattern: /Googlebot/i, name: 'Googlebot' },
+  { pattern: /Google-InspectionTool/i, name: 'Google Search Console' },
+  { pattern: /Storebot-Google/i, name: 'Google Merchant' },
+  { pattern: /AdsBot-Google/i, name: 'Google Ads' },
+  { pattern: /Mediapartners-Google/i, name: 'Google AdSense' },
+  { pattern: /APIs-Google/i, name: 'Google APIs' },
+  { pattern: /GoogleOther/i, name: 'Google Other' },
+
+  // Bing / Microsoft
+  { pattern: /bingbot/i, name: 'Bingbot' },
+  { pattern: /msnbot/i, name: 'MSN Bot' },
+  { pattern: /AdIdxBot/i, name: 'Microsoft Advertising' },
+  { pattern: /BingPreview/i, name: 'Bing Preview' },
+
+  // Other search engines
+  { pattern: /YandexBot/i, name: 'Yandex' },
+  { pattern: /DuckDuckBot/i, name: 'DuckDuckGo' },
+  { pattern: /Baiduspider/i, name: 'Baidu' },
+  { pattern: /Slurp/i, name: 'Yahoo' },
+  { pattern: /Sogou/i, name: 'Sogou' },
+  { pattern: /Applebot/i, name: 'Apple (Siri/Spotlight)' },
+  { pattern: /Qwant/i, name: 'Qwant' },
+
+  // Social media previews (important for link sharing/SEO)
+  { pattern: /facebookexternalhit/i, name: 'Facebook' },
+  { pattern: /Twitterbot/i, name: 'Twitter/X' },
+  { pattern: /LinkedInBot/i, name: 'LinkedIn' },
+  { pattern: /WhatsApp/i, name: 'WhatsApp' },
+  { pattern: /Slackbot/i, name: 'Slack' },
+  { pattern: /TelegramBot/i, name: 'Telegram' },
+  { pattern: /Discordbot/i, name: 'Discord' },
+];
+
+function isWhitelistedBot(userAgent) {
+  if (!userAgent) return false;
+  for (const { pattern, name } of WHITELISTED_BOTS) {
+    if (pattern.test(userAgent)) return name;
+  }
+  return false;
+}
+
+// =============================================================================
 // BLOCKED PATHS (immediate block for suspicious/malicious requests)
 // =============================================================================
 
@@ -594,6 +641,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Whitelist search engine bots and social media crawlers - bypass all blocking
+  const whitelistedBotName = isWhitelistedBot(userAgent);
+  if (whitelistedBotName) {
+    res.writeHead(200);
+    res.end('OK');
+    return;
+  }
+
   // Check permanent ban
   if (isPermanentlyBanned(ip)) {
     const info = bannedIPs.get(ip);
@@ -726,6 +781,7 @@ server.listen(PORT, () => {
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
+  console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
   console.log(`Blocked CIDR subnets: ${BLOCKED_CIDRS.length}`);
   console.log(`Static asset patterns: ${STATIC_ASSET_PATTERNS.length}`);
