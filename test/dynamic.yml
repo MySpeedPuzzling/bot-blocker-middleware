@@ -1,0 +1,21 @@
+http:
+  middlewares:
+    bot-blocker:
+      forwardAuth:
+        address: "http://bot-blocker:3000"
+        trustForwardHeader: true
+
+  routers:
+    myspeedpuzzling:
+      rule: "PathPrefix(`/`)"
+      entryPoints:
+        - web
+      middlewares:
+        - bot-blocker
+      service: myspeedpuzzling
+
+  services:
+    myspeedpuzzling:
+      loadBalancer:
+        servers:
+          - url: "http://host.docker.internal:8080"

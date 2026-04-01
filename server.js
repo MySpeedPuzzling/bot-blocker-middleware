@@ -19,6 +19,14 @@ const LOCALE_WINDOW = parseInt(process.env.LOCALE_WINDOW, 10) || 60000;         
 const BAN_DURATION = parseInt(process.env.BAN_DURATION, 10) || 30 * 24 * 60 * 60 * 1000; // 30 days
 const BANNED_IPS_FILE = path.join(LOG_DIR, 'banned-ips.json');
 
+// Page scraping detection (puzzle/profile pages) — windows in seconds
+const PUZZLE_SCRAPE_THRESHOLD = parseInt(process.env.PUZZLE_SCRAPE_THRESHOLD, 10) || 40;
+const PUZZLE_SCRAPE_WINDOW = (parseInt(process.env.PUZZLE_SCRAPE_WINDOW, 10) || 300) * 1000;  // 300s = 5 min
+const PROFILE_SCRAPE_THRESHOLD = parseInt(process.env.PROFILE_SCRAPE_THRESHOLD, 10) || 40;
+const PROFILE_SCRAPE_WINDOW = (parseInt(process.env.PROFILE_SCRAPE_WINDOW, 10) || 300) * 1000;  // 300s = 5 min
+const SCRAPE_STRIKES_FOR_BAN = parseInt(process.env.SCRAPE_STRIKES_FOR_BAN, 10) || 3;
+const SCRAPE_STRIKE_WINDOW = (parseInt(process.env.SCRAPE_STRIKE_WINDOW, 10) || 86400) * 1000;  // 86400s = 24h
+
 // =============================================================================
 // STATIC ASSET PATTERNS (excluded from rate limiting)
 // =============================================================================
@@ -126,6 +134,7 @@ const BLOCKED_BOTS = [
     { pattern: /ClaudeBot/i, reason: 'Anthropic training crawler' },
     { pattern: /Amazonbot/i, reason: 'Amazon Alexa indexer' },
     { pattern: /Barkrowler/i, reason: 'SEO crawler bot (Barkrowler)' },
+    { pattern: /MySpeedPuzzling-Research-Scraper/i, reason: 'Known data scraper' },
 
     // =========================================================================
     // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
@@ -426,18 +435,114 @@ function checkLocaleSwitch(ip, requestPath) {
 }
 
 // =============================================================================
+// PAGE SCRAPING DETECTION (puzzle/profile pages)
+// =============================================================================
+
+const PUZZLE_PAGE_PATTERN = /^\/((?:en|es|fr|de|ja)\/)?(?:puzzle|skladam-puzzle|solving-puzzle|resolviendo-puzzle|パズル解決中|パズル|resoudre-puzzle|puzzle-loesen)\/([^\/?#]+)/;
+const PROFILE_PAGE_PATTERN = /^\/((?:en|es|fr|de|ja)\/)?(?:profil-hrace|player-profile|perfil-jugador|プレイヤー-プロフィール|profil-joueur|spieler-profil)\/([^\/?#]+)/;
+
+const puzzleScrapeTracker = new Map();   // "ip|ua" -> { uniqueIds: Set, windowStart }
+const profileScrapeTracker = new Map();  // "ip|ua" -> { uniqueIds: Set, windowStart }
+const scrapeStrikes = new Map();         // ip -> [timestamp, ...]
+
+function extractPuzzleId(requestPath) {
+  const match = requestPath.match(PUZZLE_PAGE_PATTERN);
+  return match ? match[2] : null;
+}
+
+function extractProfileId(requestPath) {
+  const match = requestPath.match(PROFILE_PAGE_PATTERN);
+  return match ? match[2] : null;
+}
+
+function recordScrapeStrike(ip, reason) {
+  const now = Date.now();
+  const strikes = scrapeStrikes.get(ip) || [];
+
+  // Filter to strikes within the strike window (24h)
+  const recentStrikes = strikes.filter(ts => now - ts < SCRAPE_STRIKE_WINDOW);
+  recentStrikes.push(now);
+  scrapeStrikes.set(ip, recentStrikes);
+
+  if (recentStrikes.length >= SCRAPE_STRIKES_FOR_BAN) {
+    banIP(ip, reason, []);
+    return { banned: true, strikes: recentStrikes.length, reason };
+  }
+
+  return { banned: false, strikes: recentStrikes.length, reason };
+}
+
+function checkScrapeTracker(tracker, threshold, window, ip, userAgent, pageId, pageType) {
+  const key = ip + '|' + userAgent;
+  const now = Date.now();
+
+  if (!tracker.has(key)) {
+    const uniqueIds = new Set([pageId]);
+    tracker.set(key, { uniqueIds, windowStart: now });
+    return null;
+  }
+
+  const record = tracker.get(key);
+
+  // Reset window if expired
+  if (now - record.windowStart > window) {
+    record.uniqueIds = new Set([pageId]);
+    record.windowStart = now;
+    return null;
+  }
+
+  record.uniqueIds.add(pageId);
+
+  if (record.uniqueIds.size >= threshold) {
+    const elapsed = Math.round((now - record.windowStart) / 1000);
+    const reason = `${pageType} scraping detected: ${record.uniqueIds.size} unique pages in ${elapsed}s`;
+    // Reset tracker so next window can trigger a new strike (keep triggering ID)
+    record.uniqueIds = new Set([pageId]);
+    record.windowStart = now;
+    return recordScrapeStrike(ip, reason);
+  }
+
+  return null;
+}
+
+/**
+ * Checks if request is part of systematic page scraping.
+ * Returns { banned, strikes, reason } if threshold exceeded, null otherwise.
+ */
+function checkPageScraping(ip, userAgent, requestPath) {
+  const puzzleId = extractPuzzleId(requestPath);
+  if (puzzleId) {
+    return checkScrapeTracker(
+      puzzleScrapeTracker, PUZZLE_SCRAPE_THRESHOLD, PUZZLE_SCRAPE_WINDOW,
+      ip, userAgent, puzzleId, 'Puzzle'
+    );
+  }
+
+  const profileId = extractProfileId(requestPath);
+  if (profileId) {
+    return checkScrapeTracker(
+      profileScrapeTracker, PROFILE_SCRAPE_THRESHOLD, PROFILE_SCRAPE_WINDOW,
+      ip, userAgent, profileId, 'Profile'
+    );
+  }
+
+  return null;
+}
+
+// =============================================================================
 // RATE LIMITING
 // =============================================================================
 
-function isRateLimited(ip) {
+function isRateLimited(ip, userAgent) {
+  const key = ip + '|' + userAgent;
   const now = Date.now();
 
-  if (!requests.has(ip)) {
-    requests.set(ip, { count: 1, windowStart: now });
+  if (!requests.has(key)) {
+    requests.set(key, { count: 1, windowStart: now });
     return false;
   }
 
-  const record = requests.get(ip);
+  const record = requests.get(key);
 
   if (now - record.windowStart > RATE_WINDOW) {
     record.count = 1;
@@ -464,6 +569,28 @@ setInterval(() => {
   for (const [key, record] of localeTracker) {
     if (now - record.windowStart > LOCALE_WINDOW * 2) {
       localeTracker.delete(key);
+    }
+  }
+
+  // Clean page scraping trackers
+  for (const [key, record] of puzzleScrapeTracker) {
+    if (now - record.windowStart > PUZZLE_SCRAPE_WINDOW * 2) {
+      puzzleScrapeTracker.delete(key);
+    }
+  }
+  for (const [key, record] of profileScrapeTracker) {
+    if (now - record.windowStart > PROFILE_SCRAPE_WINDOW * 2) {
+      profileScrapeTracker.delete(key);
+    }
+  }
+
+  // Clean expired scrape strikes
+  for (const [ip, strikes] of scrapeStrikes) {
+    const recent = strikes.filter(ts => now - ts < SCRAPE_STRIKE_WINDOW);
+    if (recent.length === 0) {
+      scrapeStrikes.delete(ip);
+    } else {
+      scrapeStrikes.set(ip, recent);
     }
   }
 }, 5 * 60 * 1000);
@@ -751,8 +878,37 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Check page scraping (puzzle/profile) — progressive: 429 on 1st/2nd strike, permaban on 3rd
+  const scrapeResult = checkPageScraping(ip, userAgent, requestPath);
+  if (scrapeResult) {
+    if (scrapeResult.banned) {
+      logBlocked('page_scrape_ban', ip, userAgent, scrapeResult.reason, requestPath);
+
+      const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g,
+        `Permanently banned: ${scrapeResult.reason}`);
+
+      res.writeHead(403, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'X-Blocked-Reason': 'page_scrape_ban',
+      });
+      res.end(html);
+      return;
+    } else {
+      logBlocked('page_scrape', ip, userAgent,
+        `Strike ${scrapeResult.strikes}/${SCRAPE_STRIKES_FOR_BAN}: ${scrapeResult.reason}`, requestPath);
+
+      res.writeHead(429, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Retry-After': '300',
+        'X-Blocked-Reason': 'page_scrape',
+      });
+      res.end(RATE_LIMITED_HTML);
+      return;
+    }
+  }
+
   // Check rate limit
-  if (isRateLimited(ip)) {
+  if (isRateLimited(ip, userAgent)) {
     logBlocked('rate_limit', ip, userAgent, 'Too many requests', requestPath);
 
     res.writeHead(429, {
@@ -780,6 +936,7 @@ server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
+  console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);

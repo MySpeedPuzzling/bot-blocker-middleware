@@ -1,0 +1,27 @@
+services:
+  traefik:
+    image: traefik:v2.10
+    ports:
+      - "8088:80"
+    volumes:
+      - ./traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./dynamic.yml:/etc/traefik/dynamic.yml:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - bot-blocker
+
+  bot-blocker:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      - LOG_DIR=/tmp/bot-blocker-logs
+      - RATE_LIMIT=90
+      # Lower thresholds for faster testing
+      - PUZZLE_SCRAPE_THRESHOLD=5
+      - PROFILE_SCRAPE_THRESHOLD=5
+      - PUZZLE_SCRAPE_WINDOW=60
+      - PROFILE_SCRAPE_WINDOW=60
+      - SCRAPE_STRIKES_FOR_BAN=3
+      - SCRAPE_STRIKE_WINDOW=300
