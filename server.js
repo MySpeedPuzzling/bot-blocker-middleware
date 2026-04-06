@@ -78,7 +78,6 @@ const WHITELISTED_BOTS = [
   { pattern: /DuckDuckBot/i, name: 'DuckDuckGo' },
   { pattern: /Baiduspider/i, name: 'Baidu' },
   { pattern: /Slurp/i, name: 'Yahoo' },
-  { pattern: /Sogou/i, name: 'Sogou' },
   { pattern: /Applebot/i, name: 'Apple (Siri/Spotlight)' },
   { pattern: /Qwant/i, name: 'Qwant' },
 
@@ -135,6 +134,19 @@ const BLOCKED_BOTS = [
     { pattern: /Amazonbot/i, reason: 'Amazon Alexa indexer' },
     { pattern: /Barkrowler/i, reason: 'SEO crawler bot (Barkrowler)' },
     { pattern: /MySpeedPuzzling-Research-Scraper/i, reason: 'Known data scraper' },
+    { pattern: /Sogou/i, reason: 'Sogou spider (Chinese search engine)' },
+    { pattern: /HeadlessChrome/i, reason: 'Headless browser automation' },
+    { pattern: /newsai/i, reason: 'AI news scraper' },
+    { pattern: /BacklinksExtendedBot/i, reason: 'SEO backlinks crawler' },
+    { pattern: /PerplexityBot/i, reason: 'AI answer engine crawler' },
+    { pattern: /CensysInspect/i, reason: 'Internet scanner' },
+
+    // =========================================================================
+    // FAKE/IMPOSSIBLE BROWSER SIGNATURES
+    // =========================================================================
+
+    // Opera Presto engine discontinued in 2013 — all modern Opera uses Chromium
+    { pattern: /Presto\/\d/i, reason: 'Fake Opera bot (Presto engine discontinued 2013)' },
 
     // =========================================================================
     // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
@@ -250,6 +262,38 @@ const CLOUD_PROVIDER_CIDRS = [
   { network: 0x2FF40000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 47.244.0.0/14 (47.244-247)
   { network: 0x2FF80000, mask: 0xFFF80000, name: 'Alibaba Cloud' },   // 47.248.0.0/13 (47.248-255)
   { network: 0x08D00000, mask: 0xFFF00000, name: 'Alibaba Cloud' },   // 8.208.0.0/12  (8.208-223)
+  { network: 0x712C0000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 113.44.0.0/14 (113.44-47)
+  { network: 0x015C0000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 1.92.0.0/14   (1.92-95)
+
+  // Huawei Cloud (AS136907, AS55990)
+  { network: 0x74CC0000, mask: 0xFFFC0000, name: 'Huawei Cloud' },    // 116.204.0.0/14 (116.204-207)
+  { network: 0x77080000, mask: 0xFFF80000, name: 'Huawei Cloud' },    // 119.8.0.0/13  (119.8-15)
+  { network: 0x79250000, mask: 0xFFFF0000, name: 'Huawei Cloud' },    // 121.37.0.0/16
+  { network: 0x7A700000, mask: 0xFFF00000, name: 'Huawei Cloud' },    // 122.112.0.0/12 (122.112-127)
+  { network: 0x72740000, mask: 0xFFFC0000, name: 'Huawei Cloud' },    // 114.116.0.0/14 (114.116-119)
+  { network: 0x7C460000, mask: 0xFFFE0000, name: 'Huawei Cloud' },    // 124.70.0.0/15  (124.70-71)
+  { network: 0x8B9F0000, mask: 0xFFFF0000, name: 'Huawei Cloud' },    // 139.159.0.0/16
+  { network: 0x6EEE0000, mask: 0xFFFE0000, name: 'Huawei Cloud' },    // 110.238.0.0/15 (110.238-239)
+
+  // OVH / OVHcloud (AS16276) — hosting provider, not residential
+  { network: 0x334B0000, mask: 0xFFFF0000, name: 'OVH' },             // 51.75.0.0/16
+  { network: 0x334D0000, mask: 0xFFFF0000, name: 'OVH' },             // 51.77.0.0/16
+  { network: 0x33260000, mask: 0xFFFE0000, name: 'OVH' },             // 51.38.0.0/15  (51.38-39)
+  { network: 0x335B0000, mask: 0xFFFF0000, name: 'OVH' },             // 51.91.0.0/16
+  { network: 0x39810000, mask: 0xFFFF0000, name: 'OVH' },             // 57.129.0.0/16
+  { network: 0x8D5E0000, mask: 0xFFFE0000, name: 'OVH' },             // 141.94.0.0/15  (141.94-95)
+  { network: 0x91EF0000, mask: 0xFFFF0000, name: 'OVH' },             // 145.239.0.0/16
+  { network: 0x95CA0000, mask: 0xFFFE0000, name: 'OVH' },             // 149.202.0.0/15 (149.202-203)
+  { network: 0x36250000, mask: 0xFFFF0000, name: 'OVH' },             // 54.37.0.0/16
+  { network: 0x33440000, mask: 0xFFFC0000, name: 'OVH' },             // 51.68.0.0/14  (51.68-71)
+  { network: 0x33C30000, mask: 0xFFFF0000, name: 'OVH' },             // 51.195.0.0/16
+  { network: 0x97500000, mask: 0xFFFC0000, name: 'OVH' },             // 151.80.0.0/14  (151.80-83)
+  { network: 0x33530000, mask: 0xFFFF0000, name: 'OVH' },             // 51.83.0.0/16
+  { network: 0x33590000, mask: 0xFFFF0000, name: 'OVH' },             // 51.89.0.0/16
+  { network: 0x5B860000, mask: 0xFFFE0000, name: 'OVH' },             // 91.134.0.0/15  (91.134-135)
+  { network: 0x877D0000, mask: 0xFFFF0000, name: 'OVH' },             // 135.125.0.0/16
+  { network: 0xB01F0000, mask: 0xFFFF0000, name: 'OVH' },             // 176.31.0.0/16
+  { network: 0x57620000, mask: 0xFFFE0000, name: 'OVH' },             // 87.98.0.0/15   (87.98-99)
 ];
 
 function ipToInt(ip) {
@@ -276,7 +320,11 @@ function isCloudProviderIP(ip) {
 /**
  * Detects cloud-hosted bots using HTTP/1.1 protocol.
  * Requires X-Original-Protocol header from Traefik plugin.
- * Real browsers negotiate HTTP/2+ via TLS ALPN; HTTP/1.1 + Chrome = bot.
+ * Real browsers negotiate HTTP/2+ via TLS ALPN; HTTP/1.1 from cloud IP = bot.
+ *
+ * Originally only matched Windows+Chrome UAs, but the botnet evolved to use
+ * Android and Mac UAs (2026-04-06). Now matches any browser-like UA.
+ * No real users browse from cloud provider VMs, so this is safe.
  */
 function isCloudBotnet(ip, userAgent, originalProtocol) {
   // Only works if Traefik plugin is installed and provides the header
@@ -285,8 +333,14 @@ function isCloudBotnet(ip, userAgent, originalProtocol) {
   // Only flag HTTP/1.1 connections
   if (originalProtocol !== 'HTTP/1.1') return false;
 
-  // Only flag Windows Chrome user agents (the botnet fingerprint)
-  if (!/Windows NT 10\.0.*Chrome\/\d+\./.test(userAgent || '')) return false;
+  // Flag any browser-like user agent (Mozilla/5.0 covers all real browsers)
+  // Also catch empty UAs from cloud IPs (scanners/scrapers)
+  if (!userAgent || userAgent.length === 0) {
+    // Empty UA from cloud IP = scanner
+    return isCloudProviderIP(ip);
+  }
+
+  if (!/Mozilla\/5\.0/.test(userAgent)) return false;
 
   // Must be from a known cloud provider
   return isCloudProviderIP(ip);
@@ -960,6 +1014,19 @@ const server = http.createServer((req, res) => {
       res.end(html);
       return;
     }
+  }
+
+  // Block empty user agent on HTTP/1.1 (scanners/scrapers — real browsers always send UA)
+  if ((!userAgent || userAgent.trim().length === 0) && originalProtocol === 'HTTP/1.1') {
+    const reason = 'Empty user agent on HTTP/1.1 (scanner/scraper)';
+    logBlocked('bot', ip, userAgent || '', reason, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'empty_ua',
+    });
+    res.end(html);
+    return;
   }
 
   // Check blocked subnets (known botnet IPs)
