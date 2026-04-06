@@ -189,14 +189,14 @@ function isBlockedSubnet(ip) {
 // =============================================================================
 
 /**
- * Detects Chinese botnet based on combination of IP, protocol, and user agent
- * Pattern: 43.x IP + HTTP/1.1 + Windows 10 + Chrome 100-139
+ * Detects Chinese cloud botnet based on IP range and user agent.
+ * Pattern: 43.x IP (Tencent/Alibaba APNIC block) + Windows 10 + Chrome (any version).
+ * The httpVersion check was removed — ForwardAuth always uses HTTP/1.1 internally,
+ * so req.httpVersion is always '1.1' regardless of original client protocol.
  */
-function isChineseBotnet(ip, userAgent, httpVersion) {
+function isChineseBotnet(ip, userAgent) {
   if (!ip || !ip.startsWith('43.')) return false;
-  if (httpVersion !== '1.1') return false;
-  const botPattern = /Windows NT 10\.0.*Chrome\/(10[0-9]|11[0-9]|12[0-9]|13[0-9])\./;
-  return botPattern.test(userAgent || '');
+  return /Windows NT 10\.0.*Chrome\/\d+\./.test(userAgent || '');
 }
 
 /**
@@ -206,6 +206,90 @@ function isChineseBotnet(ip, userAgent, httpVersion) {
 function isFakeIOSBot(ip, userAgent) {
   if (!ip || !ip.startsWith('43.')) return false;
   return /iPhone OS 13_2_3/.test(userAgent || '');
+}
+
+// =============================================================================
+// CLOUD BOTNET DETECTION (HTTP/1.1 protocol-based)
+// Requires X-Original-Protocol header from Traefik plugin
+// =============================================================================
+
+/**
+ * Cloud provider CIDR ranges used by the scraping botnet.
+ * Sources: ipverse/asn-ip (daily-updated ASN IP blocks)
+ *
+ * BytePlus/ByteDance (AS150436): 150.5.128.0/17, 163.7.0.0/17, 101.47.0.0/18
+ * Tencent Cloud (AS132203, AS45090): 129.226.0.0/16, 170.106.0.0/16,
+ *   119.28.0.0/15, 162.62.0.0/16, 49.51.0.0/16
+ * Alibaba Cloud (AS45102): 47.52.0.0/14, 47.74.0.0/15, 47.88.0.0/14,
+ *   47.236.0.0/14, 47.244.0.0/14, 8.208.0.0/12
+ *
+ * Note: 43.x is handled separately by isChineseBotnet() above.
+ */
+const CLOUD_PROVIDER_CIDRS = [
+  // BytePlus / ByteDance
+  { network: 0x96058000, mask: 0xFFFF8000, name: 'BytePlus' },        // 150.5.128.0/17
+  { network: 0xA3070000, mask: 0xFFFF8000, name: 'BytePlus' },        // 163.7.0.0/17
+  { network: 0x652F0000, mask: 0xFFFFC000, name: 'BytePlus' },        // 101.47.0.0/18
+
+  // Tencent Cloud
+  { network: 0x81E20000, mask: 0xFFFF0000, name: 'Tencent Cloud' },   // 129.226.0.0/16
+  { network: 0xAA6A0000, mask: 0xFFFF0000, name: 'Tencent Cloud' },   // 170.106.0.0/16
+  { network: 0x771C0000, mask: 0xFFFE0000, name: 'Tencent Cloud' },   // 119.28.0.0/15
+  { network: 0xA23E0000, mask: 0xFFFF0000, name: 'Tencent Cloud' },   // 162.62.0.0/16
+  { network: 0x31330000, mask: 0xFFFF0000, name: 'Tencent Cloud' },   // 49.51.0.0/16
+
+  // Alibaba Cloud (AS45102) — extensive 47.x allocation
+  { network: 0x2F340000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 47.52.0.0/14  (47.52-55)
+  { network: 0x2F380000, mask: 0xFFFE0000, name: 'Alibaba Cloud' },   // 47.56.0.0/15  (47.56-57)
+  { network: 0x2F4A0000, mask: 0xFFFE0000, name: 'Alibaba Cloud' },   // 47.74.0.0/15  (47.74-75)
+  { network: 0x2F4C0000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 47.76.0.0/14  (47.76-79)
+  { network: 0x2F500000, mask: 0xFFF00000, name: 'Alibaba Cloud' },   // 47.80.0.0/12  (47.80-95)
+  { network: 0x2F600000, mask: 0xFFE00000, name: 'Alibaba Cloud' },   // 47.96.0.0/11  (47.96-127)
+  { network: 0x2FEC0000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 47.236.0.0/14 (47.236-239)
+  { network: 0x2FF00000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 47.240.0.0/14 (47.240-243)
+  { network: 0x2FF40000, mask: 0xFFFC0000, name: 'Alibaba Cloud' },   // 47.244.0.0/14 (47.244-247)
+  { network: 0x2FF80000, mask: 0xFFF80000, name: 'Alibaba Cloud' },   // 47.248.0.0/13 (47.248-255)
+  { network: 0x08D00000, mask: 0xFFF00000, name: 'Alibaba Cloud' },   // 8.208.0.0/12  (8.208-223)
+];
+
+function ipToInt(ip) {
+  const parts = ip.split('.');
+  if (parts.length !== 4) return 0;
+  return ((parseInt(parts[0], 10) << 24) |
+          (parseInt(parts[1], 10) << 16) |
+          (parseInt(parts[2], 10) << 8) |
+          parseInt(parts[3], 10)) >>> 0;
+}
+
+function isCloudProviderIP(ip) {
+  const ipInt = ipToInt(ip);
+  if (ipInt === 0) return null;
+
+  for (const cidr of CLOUD_PROVIDER_CIDRS) {
+    if (((ipInt & cidr.mask) >>> 0) === cidr.network) {
+      return cidr.name;
+    }
+  }
+  return null;
+}
+
+/**
+ * Detects cloud-hosted bots using HTTP/1.1 protocol.
+ * Requires X-Original-Protocol header from Traefik plugin.
+ * Real browsers negotiate HTTP/2+ via TLS ALPN; HTTP/1.1 + Chrome = bot.
+ */
+function isCloudBotnet(ip, userAgent, originalProtocol) {
+  // Only works if Traefik plugin is installed and provides the header
+  if (!originalProtocol) return false;
+
+  // Only flag HTTP/1.1 connections
+  if (originalProtocol !== 'HTTP/1.1') return false;
+
+  // Only flag Windows Chrome user agents (the botnet fingerprint)
+  if (!/Windows NT 10\.0.*Chrome\/\d+\./.test(userAgent || '')) return false;
+
+  // Must be from a known cloud provider
+  return isCloudProviderIP(ip);
 }
 
 // =============================================================================
@@ -435,6 +519,52 @@ function checkLocaleSwitch(ip, requestPath) {
 }
 
 // =============================================================================
+// CHROME VERSION SPAN DETECTION (catches UA rotation bots)
+// =============================================================================
+
+const CHROME_SPAN_WINDOW = 10 * 60 * 1000;  // 10 minutes
+const CHROME_SPAN_THRESHOLD = 10;            // version difference that triggers block
+const chromeVersionTracker = new Map();      // ip -> { minVersion, maxVersion, windowStart }
+
+/**
+ * Detects UA rotation bots by tracking Chrome version spread per IP.
+ * Bots rotate: Chrome/103, Chrome/111, Chrome/146 (span = 43 → blocked).
+ * Real users at competition: all have Chrome/145-146 (span = 1 → allowed).
+ * Chrome auto-updates enforce version convergence on same network.
+ */
+function checkChromeVersionSpan(ip, userAgent) {
+  if (!userAgent) return false;
+
+  // Only track Windows 10 + Chrome user agents
+  const match = userAgent.match(/Windows NT 10\.0.*Chrome\/(\d+)\./);
+  if (!match) return false;
+
+  const version = parseInt(match[1], 10);
+  const now = Date.now();
+
+  if (!chromeVersionTracker.has(ip)) {
+    chromeVersionTracker.set(ip, { minVersion: version, maxVersion: version, windowStart: now });
+    return false;
+  }
+
+  const record = chromeVersionTracker.get(ip);
+
+  // Reset window if expired
+  if (now - record.windowStart > CHROME_SPAN_WINDOW) {
+    record.minVersion = version;
+    record.maxVersion = version;
+    record.windowStart = now;
+    return false;
+  }
+
+  // Update min/max
+  if (version < record.minVersion) record.minVersion = version;
+  if (version > record.maxVersion) record.maxVersion = version;
+
+  return (record.maxVersion - record.minVersion) >= CHROME_SPAN_THRESHOLD;
+}
+
+// =============================================================================
 // PAGE SCRAPING DETECTION (puzzle/profile pages)
 // =============================================================================
 
@@ -569,6 +699,13 @@ setInterval(() => {
   for (const [key, record] of localeTracker) {
     if (now - record.windowStart > LOCALE_WINDOW * 2) {
       localeTracker.delete(key);
+    }
+  }
+
+  // Clean chrome version span tracker
+  for (const [key, record] of chromeVersionTracker) {
+    if (now - record.windowStart > CHROME_SPAN_WINDOW * 2) {
+      chromeVersionTracker.delete(key);
     }
   }
 
@@ -760,6 +897,7 @@ const server = http.createServer((req, res) => {
   const userAgent = req.headers['x-forwarded-user-agent'] || req.headers['user-agent'] || '';
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
   const requestPath = req.headers['x-forwarded-uri'] || req.url || '/';
+  const originalProtocol = req.headers['x-original-protocol'] || '';
 
   // Skip rate limiting for static assets
   if (isStaticAsset(requestPath)) {
@@ -838,7 +976,7 @@ const server = http.createServer((req, res) => {
   }
 
   // Check Chinese botnet (combination detection)
-  if (isChineseBotnet(ip, userAgent, req.httpVersion)) {
+  if (isChineseBotnet(ip, userAgent)) {
     const reason = 'Chinese cloud botnet (43.x + HTTP/1.1 + outdated Chrome)';
     logBlocked('botnet', ip, userAgent, reason, requestPath);
     const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
@@ -858,6 +996,33 @@ const server = http.createServer((req, res) => {
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'fake_ios_bot',
+    });
+    res.end(html);
+    return;
+  }
+
+  // Check cloud botnet (HTTP/1.1 + Windows Chrome + cloud provider IP)
+  const cloudProvider = isCloudBotnet(ip, userAgent, originalProtocol);
+  if (cloudProvider) {
+    const reason = `Cloud botnet (${cloudProvider} + HTTP/1.1 + Chrome)`;
+    logBlocked('cloud_botnet', ip, userAgent, reason, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'cloud_botnet',
+    });
+    res.end(html);
+    return;
+  }
+
+  // Check Chrome version span (UA rotation detection)
+  if (checkChromeVersionSpan(ip, userAgent)) {
+    const reason = 'UA rotation detected: multiple Chrome versions from same IP';
+    logBlocked('ua_rotation', ip, userAgent, reason, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'ua_rotation',
     });
     res.end(html);
     return;
@@ -937,6 +1102,8 @@ server.listen(PORT, () => {
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
+  console.log(`Chrome version span: threshold=${CHROME_SPAN_THRESHOLD} versions, window=${CHROME_SPAN_WINDOW / 1000}s`);
+  console.log(`Cloud botnet CIDR ranges: ${CLOUD_PROVIDER_CIDRS.length} (requires X-Original-Protocol header)`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
