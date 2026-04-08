@@ -80,6 +80,7 @@ const WHITELISTED_BOTS = [
   { pattern: /Slurp/i, name: 'Yahoo' },
   { pattern: /Applebot/i, name: 'Apple (Siri/Spotlight)' },
   { pattern: /Qwant/i, name: 'Qwant' },
+  { pattern: /SeznamBot/i, name: 'Seznam' },
 
   // Social media previews (important for link sharing/SEO)
   { pattern: /facebookexternalhit/i, name: 'Facebook' },
@@ -344,6 +345,22 @@ function isCloudBotnet(ip, userAgent, originalProtocol) {
 
   // Must be from a known cloud provider
   return isCloudProviderIP(ip);
+}
+
+// =============================================================================
+// HTTP/1.1 BROWSER DETECTION (residential proxy botnet)
+// Real browsers ALWAYS negotiate HTTP/2+ via TLS ALPN since 2015.
+// Any HTTP/1.1 connection with a Chrome/Firefox/Safari UA = bot using
+// residential proxies, Python requests, Go net/http, curl, etc.
+// Whitelisted bots (Googlebot, Bingbot, etc.) are checked BEFORE this.
+// =============================================================================
+
+const HTTP1_BROWSER_PATTERN = /Chrome\/\d+\.|Firefox\/\d+\./;
+
+function isHTTP1Browser(userAgent, originalProtocol) {
+  if (!originalProtocol || originalProtocol !== 'HTTP/1.1') return false;
+  if (!userAgent) return false;
+  return HTTP1_BROWSER_PATTERN.test(userAgent);
 }
 
 // =============================================================================
@@ -1077,6 +1094,21 @@ const server = http.createServer((req, res) => {
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'cloud_botnet',
+    });
+    res.end(html);
+    return;
+  }
+
+  // Check HTTP/1.1 + browser UA (residential proxy botnet)
+  // Real browsers always negotiate HTTP/2+ via TLS ALPN.
+  // HTTP/1.1 + Chrome/Firefox = bot library (requests, httpx, curl, etc.)
+  if (isHTTP1Browser(userAgent, originalProtocol)) {
+    const reason = 'HTTP/1.1 with browser UA (real browsers use HTTP/2+)';
+    logBlocked('http1_browser', ip, userAgent, reason, requestPath);
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': 'http1_browser',
     });
     res.end(html);
     return;

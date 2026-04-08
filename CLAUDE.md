@@ -27,12 +27,13 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 6. CIDR subnet check → 403 for known malicious IP ranges (43.104.33.0/24, 43.173.168.0/21)
 7. Chinese botnet check → 403 for 43.x IPs + Windows 10 + Chrome (any version)
 8. Fake iOS bot check → 403 for 43.x IPs with iPhone OS 13_2_3
-9. Cloud botnet check → 403 for HTTP/1.1 + Windows Chrome + cloud provider IPs (requires Traefik plugin)
-10. Chrome version span check → 403 if same IP sends 3+ Chrome versions spanning 10+ apart in 10 min
-11. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
-12. Page scraping check → 429/403 for rapid puzzle/profile page scraping (IP+UA keyed)
-13. Rate limiting → 429 if IP+UA exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
-14. Allow → 200 OK
+9. Cloud botnet check → 403 for HTTP/1.1 + browser UA + cloud provider IPs (requires Traefik plugin)
+10. HTTP/1.1 browser check → 403 for HTTP/1.1 + Chrome/Firefox UA from any IP (real browsers use HTTP/2+)
+11. Chrome version span check → 403 if same IP sends 3+ Chrome versions spanning 10+ apart in 10 min
+12. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
+13. Page scraping check → 429/403 for rapid puzzle/profile page scraping (IP+UA keyed)
+14. Rate limiting → 429 if IP+UA exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
+15. Allow → 200 OK
 
 **Key data structures in `server.js`:**
 - `STATIC_ASSET_PATTERNS` - regex array for paths excluded from rate limiting
@@ -42,7 +43,8 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 - `BLOCKED_CIDRS` - objects with `prefix` and `reason` for subnet blocking
 - `CLOUD_PROVIDER_CIDRS` - CIDR ranges for BytePlus, Tencent Cloud, Alibaba Cloud (proper bitmask matching)
 - `isChineseBotnet()` - detects 43.x + Windows 10 + Chrome (any version)
-- `isCloudBotnet()` - detects cloud IP + HTTP/1.1 + Windows Chrome (requires X-Original-Protocol header)
+- `isCloudBotnet()` - detects cloud IP + HTTP/1.1 + browser UA (requires X-Original-Protocol header)
+- `isHTTP1Browser()` - detects HTTP/1.1 + Chrome/Firefox UA from any IP (real browsers always use HTTP/2+)
 - `checkChromeVersionSpan()` - detects UA rotation by tracking Chrome version spread per IP
 - `isFakeIOSBot()` - detects 43.x + ancient iOS user agents
 - `requests` Map - in-memory rate limit tracking per IP+UA
