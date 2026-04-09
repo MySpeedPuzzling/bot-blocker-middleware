@@ -76,7 +76,6 @@ const WHITELISTED_BOTS = [
   // Other search engines
   { pattern: /YandexBot/i, name: 'Yandex' },
   { pattern: /DuckDuckBot/i, name: 'DuckDuckGo' },
-  { pattern: /Baiduspider/i, name: 'Baidu' },
   { pattern: /Slurp/i, name: 'Yahoo' },
   { pattern: /Applebot/i, name: 'Apple (Siri/Spotlight)' },
   { pattern: /Qwant/i, name: 'Qwant' },
@@ -84,12 +83,18 @@ const WHITELISTED_BOTS = [
 
   // Social media previews (important for link sharing/SEO)
   { pattern: /facebookexternalhit/i, name: 'Facebook' },
+  { pattern: /meta-externalagent/i, name: 'Meta (external agent)' },
+  { pattern: /meta-webindexer/i, name: 'Meta (web indexer)' },
   { pattern: /Twitterbot/i, name: 'Twitter/X' },
   { pattern: /LinkedInBot/i, name: 'LinkedIn' },
   { pattern: /WhatsApp/i, name: 'WhatsApp' },
   { pattern: /Slackbot/i, name: 'Slack' },
   { pattern: /TelegramBot/i, name: 'Telegram' },
   { pattern: /Discordbot/i, name: 'Discord' },
+
+  // Monitoring
+  { pattern: /SentryUptimeBot/i, name: 'Sentry Uptime' },
+  { pattern: /Stripe\//i, name: 'Stripe' },
 ];
 
 function isWhitelistedBot(userAgent) {
@@ -141,6 +146,13 @@ const BLOCKED_BOTS = [
     { pattern: /BacklinksExtendedBot/i, reason: 'SEO backlinks crawler' },
     { pattern: /PerplexityBot/i, reason: 'AI answer engine crawler' },
     { pattern: /CensysInspect/i, reason: 'Internet scanner' },
+    { pattern: /Baiduspider/i, reason: 'Baidu spider (aggressive cross-locale crawler)' },
+    { pattern: /DataForSeoBot/i, reason: 'SEO scraper bot (DataForSEO)' },
+    { pattern: /ChatGPT-User/i, reason: 'OpenAI ChatGPT browsing' },
+    { pattern: /YouBot/i, reason: 'You.com AI bot' },
+    { pattern: /SpiderLing/i, reason: 'NLP research crawler' },
+    { pattern: /InternetMeasurement/i, reason: 'Internet scanner' },
+    { pattern: /Palo Alto Networks/i, reason: 'Security scanner' },
 
     // =========================================================================
     // FAKE/IMPOSSIBLE BROWSER SIGNATURES
