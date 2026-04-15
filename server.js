@@ -161,6 +161,14 @@ const BLOCKED_BOTS = [
     // Opera Presto engine discontinued in 2013 — all modern Opera uses Chromium
     { pattern: /Presto\/\d/i, reason: 'Fake Opera bot (Presto engine discontinued 2013)' },
 
+    // Exact bot fingerprint: Chrome 48.0.2564.116 (Jan 2016) shared across 56+ Chinese IPs
+    // No real user runs Chrome 48 in 2026; WOW64 (32-bit on 64-bit) is also very rare
+    { pattern: /Chrome\/48\.0\.2564\.116/, reason: 'Fake Chrome 48 bot signature (shared across many CN IPs)' },
+
+    // Nexus 5 was discontinued in 2015, Android 6.0 (Marshmallow) EOL 2018
+    // No real user on a 10-year-old phone with EOL OS in 2026
+    { pattern: /Android 6\.0; Nexus 5 Build/i, reason: 'Dead device (Nexus 5 discontinued 2015, Android 6 EOL 2018)' },
+
     // =========================================================================
     // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
     // =========================================================================
@@ -197,6 +205,8 @@ const BLOCKED_CIDRS = [
   { prefix: '43.173.173.', reason: 'Known Chinese botnet subnet' },
   { prefix: '43.173.174.', reason: 'Known Chinese botnet subnet' },
   { prefix: '43.173.175.', reason: 'Known Chinese botnet subnet' },
+  // Baidu ASN 38365 — commercial crawler infrastructure, no real users
+  { prefix: '220.181.', reason: 'Baidu crawler ASN (commercial infra, no real users)' },
 ];
 
 function isBlockedSubnet(ip) {
