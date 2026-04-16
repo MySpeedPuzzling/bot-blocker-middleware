@@ -27,6 +27,24 @@ const PROFILE_SCRAPE_WINDOW = (parseInt(process.env.PROFILE_SCRAPE_WINDOW, 10) |
 const SCRAPE_STRIKES_FOR_BAN = parseInt(process.env.SCRAPE_STRIKES_FOR_BAN, 10) || 3;
 const SCRAPE_STRIKE_WINDOW = (parseInt(process.env.SCRAPE_STRIKE_WINDOW, 10) || 86400) * 1000;  // 86400s = 24h
 
+// UA velocity detection (residential-proxy botnet) — see docs/UA_VELOCITY_DETECTION.md
+const UA_VELOCITY_ENFORCE = (process.env.UA_VELOCITY_ENFORCE || 'true').toLowerCase() !== 'false';
+const UA_VELOCITY_WINDOW = parseInt(process.env.UA_VELOCITY_WINDOW, 10) || 10 * 60 * 1000;       // 10 min rolling window
+const UA_VELOCITY_FLAG_TTL = parseInt(process.env.UA_VELOCITY_FLAG_TTL, 10) || 10 * 60 * 1000;   // 10 min inactivity before flag expires
+// Tier A — enforced (conservative, low FP risk)
+const UA_VELOCITY_ENFORCE_MIN_IPS            = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_IPS, 10) || 40;
+const UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES   = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES, 10) || 30;
+const UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS   = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS, 10) || 20;
+const UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT   = parseInt(process.env.UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT, 10) || 10;
+const UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY, 10) || 50;
+// Tier B — shadow (stricter, logs only, never blocks)
+const UA_VELOCITY_SHADOW_MIN_IPS            = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_IPS, 10) || 25;
+const UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES   = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES, 10) || 20;
+const UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS   = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS, 10) || 15;
+const UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT   = parseInt(process.env.UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT, 10) || 5;
+const UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY, 10) || 40;
+const TRUSTED_IP_TTL = 24 * 60 * 60 * 1000; // 24h — real-user trust expires after a day
+
 // =============================================================================
 // STATIC ASSET PATTERNS (excluded from rate limiting)
 // =============================================================================
@@ -753,6 +771,143 @@ function checkPageScraping(ip, userAgent, requestPath) {
 }
 
 // =============================================================================
+// UA VELOCITY DETECTION (residential-proxy botnet)
+// =============================================================================
+// Flags a UA when many distinct IPs share it in a short window AND those IPs
+// collectively show "content scraper" signature (UUID-direct entry, near-zero
+// homepage visits, each IP hitting a DIFFERENT UUID). Only blocks untrusted
+// IPs using the flagged UA — trusted IPs (those that have hit homepage/listing
+// within 24h) and trust-marker paths always pass through.
+// See docs/UA_VELOCITY_DETECTION.md for rationale.
+
+const FULL_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+// Social in-app browsers legitimately produce concentrated same-UA viral
+// traffic — exempt from velocity tracking entirely.
+// Positive-anchored to avoid matching TikTokSpider (already blocked).
+const IN_APP_BROWSER_RE = /FBAN|FBAV|Instagram|MicroMessenger|\bLine\/|Snapchat|Twitter for iPhone/i;
+
+// Trust markers — hitting any of these = real-user behavior evidence.
+const TRUST_MARKER_PATHS = [
+  /^\/$/,                                                 // root
+  /^\/(en|cs|de|es|fr|ja)\/?$/,                           // locale root
+  /^\/(en|cs|de|es|fr|ja)\/home\/?$/,                     // homepage
+  /^\/(en|cs|de|es|fr|ja)\/(puzzles|players|brands|blog|competitions|news|events|sale|manufacturers|shops|rankings|leaderboard|statistics|announcement|calendar)(\/|\?|$)/i,
+  /^\/(en|cs|de|es|fr|ja)\/(login|register|account|settings|profile-edit|logout|password)/i,
+  /^\/puzzle-stopky\/?$/,                                 // stopwatch (CS root-relative landing)
+];
+
+function isUuidPath(p) { return FULL_UUID_RE.test(p); }
+function isInAppBrowser(ua) { return !!ua && IN_APP_BROWSER_RE.test(ua); }
+
+function isTrustMarkerRequest(requestPath, method) {
+  // Any POST/PUT/DELETE is strong real-user signal (bots rarely submit forms)
+  if (method && method !== 'GET' && method !== 'HEAD') return true;
+  for (const re of TRUST_MARKER_PATHS) if (re.test(requestPath)) return true;
+  return false;
+}
+
+// Collapse IPv6 to /64 prefix so one user's IPv6 rotation = one key.
+function ipKey(ip) {
+  if (!ip) return '';
+  if (!ip.includes(':')) return ip;
+  const parts = ip.split(':');
+  return parts.slice(0, 4).join(':');
+}
+
+const uaVelocityTracker = new Map();
+// UA -> { ips: Set<ipKey>, uuidEntries, homepageVisits, uniqueUuidPaths: Set,
+//         windowStart, flagged, flaggedAt, shadowLogged }
+
+const trustedIpTracker = new Map();  // ipKey -> { lastGoodAction }
+
+function markIpTrusted(ipK) {
+  if (!ipK) return;
+  trustedIpTracker.set(ipK, { lastGoodAction: Date.now() });
+}
+
+function isTrustedIp(ipK) {
+  const rec = trustedIpTracker.get(ipK);
+  if (!rec) return false;
+  if (Date.now() - rec.lastGoodAction > TRUSTED_IP_TTL) {
+    trustedIpTracker.delete(ipK);
+    return false;
+  }
+  return true;
+}
+
+function updateUaVelocity(ua, ipK, requestPath, method) {
+  if (!ua || !ipK) return;
+  if (isInAppBrowser(ua)) return;  // exempt
+
+  const now = Date.now();
+  let rec = uaVelocityTracker.get(ua);
+  if (!rec || now - rec.windowStart > UA_VELOCITY_WINDOW) {
+    rec = {
+      ips: new Set(),
+      uuidEntries: 0,
+      homepageVisits: 0,
+      uniqueUuidPaths: new Set(),
+      windowStart: now,
+      flagged: false,
+      flaggedAt: 0,
+      shadowLogged: false,
+    };
+    uaVelocityTracker.set(ua, rec);
+  }
+
+  if (!rec.ips.has(ipK)) {
+    rec.ips.add(ipK);
+    if (isTrustMarkerRequest(requestPath, method)) rec.homepageVisits++;
+    else if (isUuidPath(requestPath)) rec.uuidEntries++;
+  }
+  if (isUuidPath(requestPath)) rec.uniqueUuidPaths.add(requestPath);
+
+  // Tier A — enforce (integer math: pct gate is  a*100 vs b*PCT)
+  if (!rec.flagged
+      && rec.ips.size >= UA_VELOCITY_ENFORCE_MIN_IPS
+      && rec.uuidEntries >= UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES
+      && rec.uniqueUuidPaths.size >= UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS
+      && rec.homepageVisits * 100 < rec.ips.size * UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT
+      && rec.uniqueUuidPaths.size * 100 >= rec.ips.size * UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY) {
+    rec.flagged = true;
+    rec.flaggedAt = now;
+    const hp = Math.round(rec.homepageVisits * 100 / rec.ips.size);
+    const uu = Math.round(rec.uuidEntries * 100 / rec.ips.size);
+    const dv = Math.round(rec.uniqueUuidPaths.size * 100 / rec.ips.size);
+    console.log(`[UA_VELOCITY_FLAG] ips=${rec.ips.size} uuidEntries=${rec.uuidEntries} uniquePaths=${rec.uniqueUuidPaths.size} homepage=${hp}% uuid=${uu}% diversity=${dv}% UA=${ua.substring(0, 120)}`);
+  }
+
+  // Tier B — shadow (log only; fires once per window)
+  if (!rec.shadowLogged
+      && rec.ips.size >= UA_VELOCITY_SHADOW_MIN_IPS
+      && rec.uuidEntries >= UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES
+      && rec.uniqueUuidPaths.size >= UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS
+      && rec.homepageVisits * 100 < rec.ips.size * UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT
+      && rec.uniqueUuidPaths.size * 100 >= rec.ips.size * UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY) {
+    rec.shadowLogged = true;
+    const hp = Math.round(rec.homepageVisits * 100 / rec.ips.size);
+    const uu = Math.round(rec.uuidEntries * 100 / rec.ips.size);
+    const dv = Math.round(rec.uniqueUuidPaths.size * 100 / rec.ips.size);
+    console.log(`[UA_VELOCITY_SHADOW] ips=${rec.ips.size} uuidEntries=${rec.uuidEntries} uniquePaths=${rec.uniqueUuidPaths.size} homepage=${hp}% uuid=${uu}% diversity=${dv}% UA=${ua.substring(0, 120)}`);
+  }
+}
+
+function shouldBlockByUaVelocity(ua, ipK, requestPath, method) {
+  if (!ua || !ipK) return false;
+  if (isInAppBrowser(ua)) return false;
+  const rec = uaVelocityTracker.get(ua);
+  if (!rec || !rec.flagged) return false;
+  if (Date.now() - rec.flaggedAt > UA_VELOCITY_FLAG_TTL) {
+    rec.flagged = false;
+    return false;
+  }
+  if (isTrustMarkerRequest(requestPath, method)) return false;  // never block recovery path
+  if (isTrustedIp(ipK)) return false;                           // known real user
+  return true;
+}
+
+// =============================================================================
 // RATE LIMITING
 // =============================================================================
 
@@ -821,6 +976,20 @@ setInterval(() => {
       scrapeStrikes.delete(ip);
     } else {
       scrapeStrikes.set(ip, recent);
+    }
+  }
+
+  // Clean UA velocity tracker
+  for (const [ua, rec] of uaVelocityTracker) {
+    if (now - rec.windowStart > UA_VELOCITY_WINDOW * 2) {
+      uaVelocityTracker.delete(ua);
+    }
+  }
+
+  // Clean trusted IP tracker
+  for (const [k, rec] of trustedIpTracker) {
+    if (now - rec.lastGoodAction > TRUSTED_IP_TTL) {
+      trustedIpTracker.delete(k);
     }
   }
 }, 5 * 60 * 1000);
@@ -982,6 +1151,42 @@ const BOT_BLOCKED_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+const UA_VELOCITY_BLOCKED_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Please visit the homepage first</title>
+  <meta http-equiv="refresh" content="3;url=/">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .card { background: white; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
+      max-width: 520px; width: 100%; padding: 48px 40px; text-align: center; }
+    .icon { font-size: 64px; margin-bottom: 24px; }
+    h1 { color: #1a202c; font-size: 24px; font-weight: 700; margin-bottom: 16px; }
+    p { color: #4a5568; font-size: 15px; line-height: 1.6; margin-bottom: 16px; text-align: left; }
+    a.home { display: inline-block; background: #667eea; color: white; padding: 12px 28px;
+      border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 8px; }
+    a.home:hover { background: #5a6fdc; }
+    .contact { background: #f7fafc; border-radius: 12px; padding: 16px; margin-top: 24px; font-size: 13px; color: #4a5568; }
+    .contact a { color: #667eea; text-decoration: none; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">&#128075;</div>
+    <h1>Just a moment</h1>
+    <p><strong>EN:</strong> Our protection thinks your visit looks unusual. Please go to the homepage first, then come back to the page you wanted. You will be redirected automatically in 3&nbsp;seconds.</p>
+    <p><strong>CS:</strong> Naše ochrana si myslí, že vaše návštěva vypadá neobvykle. Otevřete prosím nejprve hlavní stránku a pak se vraťte na stránku, kterou jste chtěli. Za 3&nbsp;sekundy vás přesměrujeme.</p>
+    <a class="home" href="/">Go to homepage / Na hlavní stránku</a>
+    <div class="contact">If this keeps happening, please contact <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a>.</div>
+  </div>
+</body>
+</html>`;
+
 // =============================================================================
 // HTTP SERVER
 // =============================================================================
@@ -1136,6 +1341,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Check UA velocity (residential proxy botnet driving real Chromium)
+  // Updates the tracker first so the rule can self-trigger on the current request,
+  // then decides to block only if the UA is flagged AND IP is untrusted AND path
+  // is not a trust marker. See docs/UA_VELOCITY_DETECTION.md.
+  {
+    const ipK = ipKey(ip);
+    updateUaVelocity(userAgent, ipK, requestPath, req.method);
+    if (isTrustMarkerRequest(requestPath, req.method)) markIpTrusted(ipK);
+    if (shouldBlockByUaVelocity(userAgent, ipK, requestPath, req.method)) {
+      const reason = 'UA velocity: same UA from many IPs with scraper signature';
+      if (UA_VELOCITY_ENFORCE) {
+        logBlocked('ua_velocity', ip, userAgent, reason, requestPath);
+        res.writeHead(429, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Retry-After': '300',
+          'X-Blocked-Reason': 'ua_velocity',
+        });
+        res.end(UA_VELOCITY_BLOCKED_HTML);
+        return;
+      } else {
+        // Dry-run safety net (if operator flips UA_VELOCITY_ENFORCE=false)
+        console.log(`[UA_VELOCITY_WOULD_BLOCK] ${ip} ${requestPath} UA=${userAgent.substring(0, 100)}`);
+      }
+    }
+  }
+
   // Check Chrome version span (UA rotation detection)
   if (checkChromeVersionSpan(ip, userAgent)) {
     const reason = 'UA rotation detected: multiple Chrome versions from same IP';
@@ -1225,6 +1456,10 @@ server.listen(PORT, () => {
   console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
   console.log(`Chrome version span: threshold=${CHROME_SPAN_THRESHOLD} versions, window=${CHROME_SPAN_WINDOW / 1000}s`);
   console.log(`Cloud botnet CIDR ranges: ${CLOUD_PROVIDER_CIDRS.length} (requires X-Original-Protocol header)`);
+  console.log(`UA velocity enforce: ${UA_VELOCITY_ENFORCE ? 'ON' : 'OFF (dry-run)'}`);
+  console.log(`UA velocity Tier A: ${UA_VELOCITY_ENFORCE_MIN_IPS} IPs in ${UA_VELOCITY_WINDOW / 1000}s, uuidEntries>=${UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY}%`);
+  console.log(`UA velocity Tier B shadow: ${UA_VELOCITY_SHADOW_MIN_IPS} IPs, uuidEntries>=${UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY}%`);
+  console.log(`UA velocity flag TTL: ${UA_VELOCITY_FLAG_TTL / 1000}s; in-app browser exemptions: FBAN|FBAV|Instagram|MicroMessenger|Line|Snapchat|Twitter for iPhone`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
