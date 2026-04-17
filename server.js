@@ -61,6 +61,7 @@ const STATIC_ASSET_PATTERNS = [
   /^\/manifest\.json$/i,
   /^\/robots\.txt$/i,
   /^\/security\.txt$/i,
+  /^\/service-worker\.js$/i,
   /^\/site\.webmanifest$/i,
   /^\/apple/i,
   /^\/mstile/i,
@@ -225,6 +226,10 @@ const BLOCKED_CIDRS = [
   { prefix: '43.173.175.', reason: 'Known Chinese botnet subnet' },
   // Baidu ASN 38365 — commercial crawler infrastructure, no real users
   { prefix: '220.181.', reason: 'Baidu crawler ASN (commercial infra, no real users)' },
+  // Indonesian residential-proxy botnet subnet — 121+ distinct IPs observed in
+  // 8h post-deploy all sharing the same fake Chrome/133.0.6943.141 UA hitting
+  // Japanese-locale UUID pages. Caught by UA velocity; block upstream to save CPU.
+  { prefix: '202.46.62.', reason: 'Indonesian residential-proxy botnet subnet (fake Chrome/133 UA farm)' },
 ];
 
 function isBlockedSubnet(ip) {
@@ -791,9 +796,11 @@ const IN_APP_BROWSER_RE = /FBAN|FBAV|Instagram|MicroMessenger|\bLine\/|Snapchat|
 const TRUST_MARKER_PATHS = [
   /^\/$/,                                                 // root
   /^\/(en|cs|de|es|fr|ja)\/?$/,                           // locale root
-  /^\/(en|cs|de|es|fr|ja)\/home\/?$/,                     // homepage
+  /^\/(en|cs|de|es|fr|ja)\/home\/?$/,                     // localized homepage
+  /^\/home\/?$/,                                          // bare homepage (no locale)
   /^\/(en|cs|de|es|fr|ja)\/(puzzles|players|brands|blog|competitions|news|events|sale|manufacturers|shops|rankings|leaderboard|statistics|announcement|calendar)(\/|\?|$)/i,
   /^\/(en|cs|de|es|fr|ja)\/(login|register|account|settings|profile-edit|logout|password)/i,
+  /^\/(login|register|account|settings|logout|password)(\/|\?|$)/i,  // bare auth paths (no locale)
   /^\/puzzle-stopky\/?$/,                                 // stopwatch (CS root-relative landing)
 ];
 
