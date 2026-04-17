@@ -44,6 +44,10 @@ const UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS   = parseInt(process.env.UA_VELOCITY_S
 const UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT   = parseInt(process.env.UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT, 10) || 5;
 const UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY, 10) || 40;
 const TRUSTED_IP_TTL = 24 * 60 * 60 * 1000; // 24h — real-user trust expires after a day
+// Strike-based permaban: IP+UA combo accumulating N strikes in 24h = permaban.
+// Real users who trip once recover via homepage trust-marker before striking again.
+const UA_VELOCITY_STRIKES_FOR_BAN = parseInt(process.env.UA_VELOCITY_STRIKES_FOR_BAN, 10) || 3;
+const UA_VELOCITY_STRIKE_WINDOW = parseInt(process.env.UA_VELOCITY_STRIKE_WINDOW, 10) || 24 * 60 * 60 * 1000;
 
 // =============================================================================
 // STATIC ASSET PATTERNS (excluded from rate limiting)
@@ -828,6 +832,20 @@ const uaVelocityTracker = new Map();
 
 const trustedIpTracker = new Map();  // ipKey -> { lastGoodAction }
 
+// Strike tracker keyed on IP+UA so a real user sharing a CGNAT IP with a
+// different UA isn't ever struck because of someone else's bot.
+const uaVelocityStrikes = new Map();  // "ip|ua" -> [timestamp, ...]
+
+function recordUaVelocityStrike(ip, userAgent) {
+  const key = ip + '|' + userAgent;
+  const now = Date.now();
+  const strikes = uaVelocityStrikes.get(key) || [];
+  const recent = strikes.filter(ts => now - ts < UA_VELOCITY_STRIKE_WINDOW);
+  recent.push(now);
+  uaVelocityStrikes.set(key, recent);
+  return { banned: recent.length >= UA_VELOCITY_STRIKES_FOR_BAN, strikes: recent.length };
+}
+
 function markIpTrusted(ipK) {
   if (!ipK) return;
   trustedIpTracker.set(ipK, { lastGoodAction: Date.now() });
@@ -999,6 +1017,13 @@ setInterval(() => {
       trustedIpTracker.delete(k);
     }
   }
+
+  // Clean expired UA velocity strikes (same pattern as scrapeStrikes)
+  for (const [key, strikes] of uaVelocityStrikes) {
+    const recent = strikes.filter(ts => now - ts < UA_VELOCITY_STRIKE_WINDOW);
+    if (recent.length === 0) uaVelocityStrikes.delete(key);
+    else uaVelocityStrikes.set(key, recent);
+  }
 }, 5 * 60 * 1000);
 
 // =============================================================================
@@ -1163,8 +1188,8 @@ const UA_VELOCITY_BLOCKED_HTML = `<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
   <title>Please visit the homepage first</title>
-  <meta http-equiv="refresh" content="3;url=/">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -1186,8 +1211,8 @@ const UA_VELOCITY_BLOCKED_HTML = `<!DOCTYPE html>
   <div class="card">
     <div class="icon">&#128075;</div>
     <h1>Just a moment</h1>
-    <p><strong>EN:</strong> Our protection thinks your visit looks unusual. Please go to the homepage first, then come back to the page you wanted. You will be redirected automatically in 3&nbsp;seconds.</p>
-    <p><strong>CS:</strong> Naše ochrana si myslí, že vaše návštěva vypadá neobvykle. Otevřete prosím nejprve hlavní stránku a pak se vraťte na stránku, kterou jste chtěli. Za 3&nbsp;sekundy vás přesměrujeme.</p>
+    <p><strong>EN:</strong> Our protection thinks your visit looks unusual. Please click the button below to go to the homepage, then retry the page you wanted.</p>
+    <p><strong>CS:</strong> Naše ochrana si myslí, že vaše návštěva vypadá neobvykle. Klikněte prosím na tlačítko níže a otevřete hlavní stránku, pak zkuste znovu otevřít stránku, kterou jste chtěli.</p>
     <a class="home" href="/">Go to homepage / Na hlavní stránku</a>
     <div class="contact">If this keeps happening, please contact <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a>.</div>
   </div>
@@ -1359,10 +1384,29 @@ const server = http.createServer((req, res) => {
     if (shouldBlockByUaVelocity(userAgent, ipK, requestPath, req.method)) {
       const reason = 'UA velocity: same UA from many IPs with scraper signature';
       if (UA_VELOCITY_ENFORCE) {
-        logBlocked('ua_velocity', ip, userAgent, reason, requestPath);
+        const strike = recordUaVelocityStrike(ip, userAgent);
+        if (strike.banned) {
+          // Nth strike (default 3) — permaban the IP. Piggybacks existing banIP
+          // infrastructure; persisted to banned-ips.json for 30 days.
+          banIP(ip, `UA velocity scraper signature (${strike.strikes} strikes)`, []);
+          logBlocked('ua_velocity_ban', ip, userAgent,
+            `Permaban on ${strike.strikes} UA velocity strikes`, requestPath);
+          const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g,
+            `Permanently banned: repeated UA velocity scraper signature (${strike.strikes} strikes)`);
+          res.writeHead(403, {
+            'Content-Type': 'text/html; charset=utf-8',
+            'X-Robots-Tag': 'noindex, nofollow',
+            'X-Blocked-Reason': 'ua_velocity_ban',
+          });
+          res.end(html);
+          return;
+        }
+        logBlocked('ua_velocity', ip, userAgent,
+          `Strike ${strike.strikes}/${UA_VELOCITY_STRIKES_FOR_BAN}: ${reason}`, requestPath);
         res.writeHead(429, {
           'Content-Type': 'text/html; charset=utf-8',
           'Retry-After': '300',
+          'X-Robots-Tag': 'noindex, nofollow',
           'X-Blocked-Reason': 'ua_velocity',
         });
         res.end(UA_VELOCITY_BLOCKED_HTML);
@@ -1467,6 +1511,7 @@ server.listen(PORT, () => {
   console.log(`UA velocity Tier A: ${UA_VELOCITY_ENFORCE_MIN_IPS} IPs in ${UA_VELOCITY_WINDOW / 1000}s, uuidEntries>=${UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY}%`);
   console.log(`UA velocity Tier B shadow: ${UA_VELOCITY_SHADOW_MIN_IPS} IPs, uuidEntries>=${UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY}%`);
   console.log(`UA velocity flag TTL: ${UA_VELOCITY_FLAG_TTL / 1000}s; in-app browser exemptions: FBAN|FBAV|Instagram|MicroMessenger|Line|Snapchat|Twitter for iPhone`);
+  console.log(`UA velocity strikes for permaban: ${UA_VELOCITY_STRIKES_FOR_BAN} strikes in ${UA_VELOCITY_STRIKE_WINDOW / 1000 / 3600}h (keyed by IP+UA)`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);

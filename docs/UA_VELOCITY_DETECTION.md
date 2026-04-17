@@ -119,7 +119,15 @@ A request is blocked if ALL:
 3. `trustedIpTracker[ipKey]` has no `lastGoodAction` in the last 24h
 4. `UA_VELOCITY_ENFORCE === true`
 
-Response: **HTTP 429**, `Retry-After: 300`, `X-Blocked-Reason: ua_velocity`, HTML with `<meta http-equiv="refresh" content="3;url=/">` and CS+EN instructions.
+On each block the IP+UA pair accumulates a **strike**. On the **3rd strike in 24h** (default, via `UA_VELOCITY_STRIKES_FOR_BAN`), the IP is **permanently banned** via the existing `banIP()` infrastructure (30-day ban persisted to `banned-ips.json`).
+
+**Response codes:**
+- Strikes 1–2: `HTTP 429`, `Retry-After: 300`, `X-Blocked-Reason: ua_velocity`, `X-Robots-Tag: noindex, nofollow`. HTML has a **manual** "Go to homepage" button — no auto-redirect (see note below).
+- Strike N (default 3): `HTTP 403`, `X-Blocked-Reason: ua_velocity_ban`, generic bot-blocked HTML with permaban reason.
+
+**Why no auto-redirect:** early testing showed Puppeteer-driven bots were following `<meta http-equiv="refresh">` to the homepage, which returned 200 + GA JS, so they still counted as "visitors" in Google Analytics. The manual button lets real users recover (one click) while bots stay on the 429 page and never fire GA.
+
+**Why strike is IP+UA keyed, ban is IP-only:** a real user sharing a CGNAT IP with a separate UA will never strike because their UA doesn't match the flagged bot UA. The ban itself piggybacks the existing IP-keyed `banIP()` for simplicity; by the time an IP+UA pair reaches 3 strikes, the IP is almost certainly a dedicated bot (residential proxy endpoint).
 
 ---
 
@@ -140,6 +148,8 @@ Response: **HTTP 429**, `Retry-After: 300`, `X-Blocked-Reason: ua_velocity`, HTM
 | `UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS` | `15` | Tier B. |
 | `UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT` | `5` | Tier B. |
 | `UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY` | `40` | Tier B. |
+| `UA_VELOCITY_STRIKES_FOR_BAN` | `3` | Strikes by same IP+UA pair in window → permaban. |
+| `UA_VELOCITY_STRIKE_WINDOW` | `86400000` (24h) | Rolling window for counting strikes. |
 
 ---
 
@@ -172,8 +182,10 @@ Log lines emitted to `blocked-YYYY-MM-DD.log` and stdout:
 - `[UA_VELOCITY_SHADOW] …`
   - Emitted **once per window** when stricter Tier B crosses. No block. Pure diagnostic signal.
 
-- `[UA_VELOCITY] <ip> - UA velocity: same UA from many IPs with scraper signature - <ua>`
-  - Actual per-request block. Goes through the normal `logBlocked` pipeline.
+- `[UA_VELOCITY] <ip> - Strike N/3: UA velocity: same UA from many IPs with scraper signature - <ua>`
+  - Per-request 429 block. Includes strike count for the IP+UA pair.
+- `[UA_VELOCITY_BAN] <ip> - Permaban on 3 UA velocity strikes - <ua>`
+  - Emitted once when an IP+UA hits the strike threshold. The IP is then added to `banned-ips.json` and subsequent requests get caught by the upstream `permaban` check.
 
 - `[UA_VELOCITY_WOULD_BLOCK] <ip> <path> UA=<ua>`
   - Only when `UA_VELOCITY_ENFORCE=false` (dry-run mode).
