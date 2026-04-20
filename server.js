@@ -18,6 +18,7 @@ const LOCALE_MIN_HITS = parseInt(process.env.LOCALE_MIN_HITS, 10) || 3;         
 const LOCALE_WINDOW = parseInt(process.env.LOCALE_WINDOW, 10) || 60000;         // 1 minute
 const BAN_DURATION = parseInt(process.env.BAN_DURATION, 10) || 30 * 24 * 60 * 60 * 1000; // 30 days
 const BANNED_IPS_FILE = path.join(LOG_DIR, 'banned-ips.json');
+const FLAGGED_UAS_FILE = path.join(LOG_DIR, 'flagged-uas.json');
 
 // Page scraping detection (puzzle/profile pages) — windows in seconds
 const PUZZLE_SCRAPE_THRESHOLD = parseInt(process.env.PUZZLE_SCRAPE_THRESHOLD, 10) || 40;
@@ -561,6 +562,50 @@ function banIP(ip, reason, locales) {
   console.log(`[BAN] Permanently banned ${ip}: ${reason}`);
 }
 
+function loadFlaggedUAs() {
+  try {
+    if (!fs.existsSync(FLAGGED_UAS_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(FLAGGED_UAS_FILE, 'utf8'));
+    const now = Date.now();
+    let loaded = 0;
+    for (const item of data) {
+      const flaggedAt = new Date(item.flaggedAt).getTime();
+      if (isNaN(flaggedAt)) continue;
+      // Only restore flags still within TTL; keep-alive will re-extend on active attacks.
+      if (now - flaggedAt >= UA_VELOCITY_FLAG_TTL) continue;
+      uaVelocityTracker.set(item.ua, {
+        ips: new Set(),
+        uuidEntries: 0,
+        homepageVisits: 0,
+        uniqueUuidPaths: new Set(),
+        windowStart: now,
+        flagged: true,
+        flaggedAt,
+        shadowLogged: false,
+      });
+      loaded++;
+    }
+    if (loaded > 0) console.log(`[UA_VELOCITY] Restored ${loaded} active flagged UAs from ${FLAGGED_UAS_FILE}`);
+  } catch (err) {
+    console.error('[UA_VELOCITY] Failed to load flagged UAs:', err.message);
+  }
+}
+
+function saveFlaggedUAs() {
+  try {
+    const now = Date.now();
+    const data = [];
+    for (const [ua, rec] of uaVelocityTracker) {
+      if (rec.flagged && now - rec.flaggedAt < UA_VELOCITY_FLAG_TTL) {
+        data.push({ ua, flaggedAt: new Date(rec.flaggedAt).toISOString() });
+      }
+    }
+    fs.writeFileSync(FLAGGED_UAS_FILE, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('[UA_VELOCITY] Failed to save flagged UAs:', err.message);
+  }
+}
+
 function isPermanentlyBanned(ip) {
   if (!bannedIPs.has(ip)) return false;
 
@@ -868,14 +913,17 @@ function updateUaVelocity(ua, ipK, requestPath, method) {
   const now = Date.now();
   let rec = uaVelocityTracker.get(ua);
   if (!rec || now - rec.windowStart > UA_VELOCITY_WINDOW) {
+    // Preserve flag across window rolls while within FLAG_TTL — otherwise
+    // each 10-min window reset gives the botnet a fresh grace period.
+    const carry = rec && rec.flagged && (now - rec.flaggedAt) < UA_VELOCITY_FLAG_TTL;
     rec = {
       ips: new Set(),
       uuidEntries: 0,
       homepageVisits: 0,
       uniqueUuidPaths: new Set(),
       windowStart: now,
-      flagged: false,
-      flaggedAt: 0,
+      flagged: carry,
+      flaggedAt: carry ? rec.flaggedAt : 0,
       shadowLogged: false,
     };
     uaVelocityTracker.set(ua, rec);
@@ -901,6 +949,7 @@ function updateUaVelocity(ua, ipK, requestPath, method) {
     const uu = Math.round(rec.uuidEntries * 100 / rec.ips.size);
     const dv = Math.round(rec.uniqueUuidPaths.size * 100 / rec.ips.size);
     console.log(`[UA_VELOCITY_FLAG] ips=${rec.ips.size} uuidEntries=${rec.uuidEntries} uniquePaths=${rec.uniqueUuidPaths.size} homepage=${hp}% uuid=${uu}% diversity=${dv}% UA=${ua.substring(0, 120)}`);
+    saveFlaggedUAs();
   }
 
   // Tier B — shadow (log only; fires once per window)
@@ -923,12 +972,16 @@ function shouldBlockByUaVelocity(ua, ipK, requestPath, method) {
   if (isInAppBrowser(ua)) return false;
   const rec = uaVelocityTracker.get(ua);
   if (!rec || !rec.flagged) return false;
-  if (Date.now() - rec.flaggedAt > UA_VELOCITY_FLAG_TTL) {
+  const now = Date.now();
+  if (now - rec.flaggedAt > UA_VELOCITY_FLAG_TTL) {
     rec.flagged = false;
     return false;
   }
   if (isTrustMarkerRequest(requestPath, method)) return false;  // never block recovery path
   if (isTrustedIp(ipK)) return false;                           // known real user
+  // Keep-alive: extend flag as long as the attack keeps producing blockable requests.
+  // Without this the flag would TTL-expire every 10 min mid-attack.
+  rec.flaggedAt = now;
   return true;
 }
 
@@ -1004,12 +1057,17 @@ setInterval(() => {
     }
   }
 
-  // Clean UA velocity tracker
+  // Clean UA velocity tracker — but keep entries whose flag is still active
+  // so a dormant attack resuming doesn't get a fresh grace window.
   for (const [ua, rec] of uaVelocityTracker) {
-    if (now - rec.windowStart > UA_VELOCITY_WINDOW * 2) {
+    const flagAlive = rec.flagged && (now - rec.flaggedAt) < UA_VELOCITY_FLAG_TTL;
+    if (!flagAlive && now - rec.windowStart > UA_VELOCITY_WINDOW * 2) {
       uaVelocityTracker.delete(ua);
     }
   }
+
+  // Persist keep-alive extensions so flagged UAs survive container restarts.
+  saveFlaggedUAs();
 
   // Clean trusted IP tracker
   for (const [k, rec] of trustedIpTracker) {
@@ -1499,6 +1557,15 @@ const server = http.createServer((req, res) => {
 
 ensureLogDir();
 loadBannedIPs();
+loadFlaggedUAs();
+
+// Persist UA velocity flags on shutdown so restarts don't reset flagged-bot state.
+const shutdownSave = () => {
+  try { saveFlaggedUAs(); } catch (_) { /* best-effort */ }
+  process.exit(0);
+};
+process.on('SIGTERM', shutdownSave);
+process.on('SIGINT', shutdownSave);
 
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
@@ -1513,6 +1580,8 @@ server.listen(PORT, () => {
   console.log(`UA velocity flag TTL: ${UA_VELOCITY_FLAG_TTL / 1000}s; in-app browser exemptions: FBAN|FBAV|Instagram|MicroMessenger|Line|Snapchat|Twitter for iPhone`);
   console.log(`UA velocity strikes for permaban: ${UA_VELOCITY_STRIKES_FOR_BAN} strikes in ${UA_VELOCITY_STRIKE_WINDOW / 1000 / 3600}h (keyed by IP+UA)`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
+  const flaggedCount = Array.from(uaVelocityTracker.values()).filter(r => r.flagged).length;
+  console.log(`Flagged UAs loaded: ${flaggedCount}`);
   console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
   console.log(`Blocked CIDR subnets: ${BLOCKED_CIDRS.length}`);

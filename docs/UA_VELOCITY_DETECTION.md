@@ -37,7 +37,8 @@ Key properties:
 - **Trusted-IP bypass** — hitting any trust-marker path in the last 24h = IP bypasses velocity blocks.
 - **Soft-whitelist** for social in-app browsers (FBAN / Instagram / MicroMessenger / Line / Snapchat / Twitter for iPhone) so viral social shares never flag.
 - **Block action is 429** with a redirect-to-homepage HTML page (auto-redirect after 3s) — real users recover without contact.
-- **Short flag TTL** (10 min of inactivity) — traffic self-heals; active botnets just re-trigger.
+- **Flag persistence across window rolls, keep-alive, and container restarts** — once a UA is flagged, the flag survives the internal 10-min window reset, is kept alive for 10 min past the last block, and is saved to `flagged-uas.json` so a deploy/restart doesn't gift the botnet a fresh grace window.
+- **Flag TTL** (10 min since last block activity) — dormant UAs naturally expire; sustained attacks stay flagged indefinitely.
 - **Kill switch** — `UA_VELOCITY_ENFORCE=false` turns enforcement off while keeping shadow logs.
 
 ---
@@ -161,7 +162,10 @@ On each block the IP+UA pair accumulates a **strike**. On the **3rd strike in 24
 | Newsletter blast — one link | Same as above |
 | Puzzle competition / livestream | Same as above, plus in-app browser whitelist catches social shares |
 | Chrome auto-update rollout | Real morning traffic hits homepage heavily; `homepage > 10%` disqualifies |
-| First-time real Chinese visitor arriving via shared UUID link while UA is flagged | 429 page auto-redirects to homepage; that visit marks the IP trusted; next UUID request passes |
+| First-time real Chinese visitor arriving via shared UUID link while UA is flagged | 429 page shows "visit homepage" recovery link; the homepage hit marks the IP trusted; next UUID request passes |
+| Grace window leaking IPs every 10 min (window reset wiping flag) | Fixed: `updateUaVelocity` carries `flagged`/`flaggedAt` across window rolls while within FLAG_TTL |
+| Flag expiring mid-attack while botnet still active | Fixed: `shouldBlockByUaVelocity` keep-alives `flaggedAt = now` on every block, so flag lives as long as blocks keep firing |
+| Deploy / container restart gifting fresh grace windows | Fixed: flagged UAs persisted to `flagged-uas.json` (save on flag event, save every 5 min, save on SIGTERM); `loadFlaggedUAs()` at startup restores flags still within FLAG_TTL |
 | Evasion by adding decoy homepage visits | Absolute floor `uuidEntries >= 30` still fires |
 | Evasion by rotating UAs | Each rotated UA must independently reach the thresholds — much more expensive botnet |
 | Mobile CGNAT = 1 user looks like many IPs | Real rotation produces ~5–10 IPs, below threshold |

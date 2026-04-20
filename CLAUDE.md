@@ -56,7 +56,7 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 - `bannedIPs` Map - persisted permanent bans (loaded from `banned-ips.json`)
 - `localeTracker` Map - in-memory locale switching detection per IP
 - `chromeVersionTracker` Map - tracks min/max Chrome versions per IP for rotation detection
-- `uaVelocityTracker` Map - tracks UA → {ips, uuidEntries, homepageVisits, uniqueUuidPaths} for residential-proxy botnet detection
+- `uaVelocityTracker` Map - tracks UA → {ips, uuidEntries, homepageVisits, uniqueUuidPaths, flagged, flaggedAt} for residential-proxy botnet detection. Flag state is carried across window rolls, kept-alive on each block, and persisted to `flagged-uas.json` so a flagged UA survives window resets, attack pauses within FLAG_TTL, and container restarts
 - `trustedIpTracker` Map - 24h tracker of IPs that hit a trust-marker path (homepage/listing/login/POST); bypasses UA velocity blocks
 - `updateUaVelocity()` / `shouldBlockByUaVelocity()` / `isTrustMarkerRequest()` / `markIpTrusted()` / `ipKey()` - UA velocity helpers (see `docs/UA_VELOCITY_DETECTION.md`)
 
