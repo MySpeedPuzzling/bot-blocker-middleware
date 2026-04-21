@@ -115,6 +115,7 @@ Use `ipToInt()` to convert IP addresses. Source for ranges: https://github.com/i
 
 - `UA_VELOCITY_ENFORCE` (true) - global kill switch; set `false` for dry-run (logs only)
 - `UA_VELOCITY_WINDOW` (600000 ms / 10 min) - rolling window for UA → IP aggregation
-- `UA_VELOCITY_FLAG_TTL` (600000 ms / 10 min) - flag expires after this long without re-fire
+- `UA_VELOCITY_FLAG_TTL` (86400000 ms / 24h) - flag expires after this long without re-fire; matches `TRUSTED_IP_TTL` so active attacks stay flagged across dormant periods
+- `TRUSTED_IP_TTL` (21600000 ms / 6h) - trust window per IP; refreshed on every trust-marker hit AND every trusted-IP bypass so active users stay trusted indefinitely; idle IPs lose trust so residential proxies can't inherit overnight real-user trust
 - `UA_VELOCITY_ENFORCE_MIN_IPS` (40), `UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES` (30), `UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS` (20), `UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT` (10), `UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY` (50) - Tier A (enforces blocks)
 - `UA_VELOCITY_SHADOW_MIN_IPS` (25), `UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES` (20), `UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS` (15), `UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT` (5), `UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY` (40) - Tier B (log-only, stricter)

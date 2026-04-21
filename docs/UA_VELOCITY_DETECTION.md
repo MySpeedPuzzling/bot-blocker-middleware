@@ -138,15 +138,16 @@ On each block the IP+UA pair accumulates a **strike**. On the **3rd strike in 24
 |---|---|---|
 | `UA_VELOCITY_ENFORCE` | `true` | Global kill switch. Set `false` for dry-run (logs only). |
 | `UA_VELOCITY_WINDOW` | `600000` (10 min) | Rolling window for UA → IP aggregation. |
-| `UA_VELOCITY_FLAG_TTL` | `600000` (10 min) | Flag expires after this long without re-fire. |
-| `UA_VELOCITY_ENFORCE_MIN_IPS` | `40` | Tier A: min distinct IPs to flag. |
-| `UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES` | `30` | Tier A: min IPs whose first-seen path was UUID. |
-| `UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS` | `20` | Tier A: min distinct UUID paths hit. |
+| `UA_VELOCITY_FLAG_TTL` | `86400000` (24h) | Flag expires after this long without re-fire. Matches `TRUSTED_IP_TTL` so real-user friction is bounded to "one 429 per trust-cycle". Keep-alive on every block extends the flag indefinitely during active attacks. |
+| `TRUSTED_IP_TTL` | `21600000` (6h) | Trust window. An IP loses trust if idle for this long. Active browsing refreshes the window on every request (both trust-marker hits and trusted-IP bypasses), so real users stay trusted indefinitely while residential-proxy IPs can't inherit overnight real-user trust. |
+| `UA_VELOCITY_ENFORCE_MIN_IPS` | `40` (code default) / `20` (prod override) | Tier A: min distinct IPs to flag. |
+| `UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES` | `30` / `16` (prod) | Tier A: min IPs whose first-seen path was UUID. |
+| `UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS` | `20` / `13` (prod) | Tier A: min distinct UUID paths hit. |
 | `UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT` | `10` | Tier A: homepage visits must be `< X%` of ips. |
 | `UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY` | `50` | Tier A: `uniqueUuidPaths / ips` must be `>= X%`. |
-| `UA_VELOCITY_SHADOW_MIN_IPS` | `25` | Tier B shadow: log-only stricter thresholds. |
-| `UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES` | `20` | Tier B. |
-| `UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS` | `15` | Tier B. |
+| `UA_VELOCITY_SHADOW_MIN_IPS` | `25` / `15` (prod) | Tier B shadow: log-only stricter thresholds. |
+| `UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES` | `20` / `12` (prod) | Tier B. |
+| `UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS` | `15` / `10` (prod) | Tier B. |
 | `UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT` | `5` | Tier B. |
 | `UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY` | `40` | Tier B. |
 | `UA_VELOCITY_STRIKES_FOR_BAN` | `3` | Strikes by same IP+UA pair in window → permaban. |

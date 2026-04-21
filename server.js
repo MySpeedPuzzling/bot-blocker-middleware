@@ -31,7 +31,7 @@ const SCRAPE_STRIKE_WINDOW = (parseInt(process.env.SCRAPE_STRIKE_WINDOW, 10) || 
 // UA velocity detection (residential-proxy botnet) — see docs/UA_VELOCITY_DETECTION.md
 const UA_VELOCITY_ENFORCE = (process.env.UA_VELOCITY_ENFORCE || 'true').toLowerCase() !== 'false';
 const UA_VELOCITY_WINDOW = parseInt(process.env.UA_VELOCITY_WINDOW, 10) || 10 * 60 * 1000;       // 10 min rolling window
-const UA_VELOCITY_FLAG_TTL = parseInt(process.env.UA_VELOCITY_FLAG_TTL, 10) || 10 * 60 * 1000;   // 10 min inactivity before flag expires
+const UA_VELOCITY_FLAG_TTL = parseInt(process.env.UA_VELOCITY_FLAG_TTL, 10) || 24 * 60 * 60 * 1000;   // 24h: flag survives attack pauses and deploys without re-opening cold-start grace window
 // Tier A — enforced (conservative, low FP risk)
 const UA_VELOCITY_ENFORCE_MIN_IPS            = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_IPS, 10) || 40;
 const UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES   = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES, 10) || 30;
@@ -44,7 +44,7 @@ const UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES   = parseInt(process.env.UA_VELOCITY_S
 const UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS   = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS, 10) || 15;
 const UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT   = parseInt(process.env.UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT, 10) || 5;
 const UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY, 10) || 40;
-const TRUSTED_IP_TTL = 24 * 60 * 60 * 1000; // 24h — real-user trust expires after a day
+const TRUSTED_IP_TTL = parseInt(process.env.TRUSTED_IP_TTL, 10) || 6 * 60 * 60 * 1000; // 6h — shorter window so residential-proxy IPs can't inherit overnight trust. Active users get refreshed on every bypass, so real browsing sessions stay trusted indefinitely.
 // Strike-based permaban: IP+UA combo accumulating N strikes in 24h = permaban.
 // Real users who trip once recover via homepage trust-marker before striking again.
 const UA_VELOCITY_STRIKES_FOR_BAN = parseInt(process.env.UA_VELOCITY_STRIKES_FOR_BAN, 10) || 3;
@@ -978,7 +978,13 @@ function shouldBlockByUaVelocity(ua, ipK, requestPath, method) {
     return false;
   }
   if (isTrustMarkerRequest(requestPath, method)) return false;  // never block recovery path
-  if (isTrustedIp(ipK)) return false;                           // known real user
+  if (isTrustedIp(ipK)) {
+    // Refresh trust on every bypass: active real-user sessions stay trusted
+    // indefinitely; only IPs idle for >TRUSTED_IP_TTL lose trust (which kills
+    // residential-proxy trust-inheritance from overnight real-user sessions).
+    markIpTrusted(ipK);
+    return false;
+  }
   // Keep-alive: extend flag as long as the attack keeps producing blockable requests.
   // Without this the flag would TTL-expire every 10 min mid-attack.
   rec.flaggedAt = now;
