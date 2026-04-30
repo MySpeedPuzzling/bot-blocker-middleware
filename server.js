@@ -81,7 +81,11 @@ const STATIC_ASSET_PATTERNS = [
   // /rank-icons-sprite.svg + /stat-icons-sprite.svg + /difficulty-icons-sprite.svg
   // in parallel; before this, that racked up 3 strikes in <20ms and permabanned
   // real users on first click. Matches root-level files with static extensions.
-  /^\/[^/?]+\.(svg|png|jpg|jpeg|gif|webp|ico|woff2?|ttf|eot|otf|css|map)(\?|$)/i,
+  // Image: svg/png/jpg/jpeg/gif/webp/avif/heic/heif/bmp/tiff/tif/ico
+  // Font:  woff/woff2/ttf/eot/otf
+  // Media: mp4/webm/ogv/mov/m4v/mp3/wav/ogg/m4a/opus/flac/aac
+  // Other: css/map/pdf
+  /^\/[^/?]+\.(svg|png|jpg|jpeg|gif|webp|avif|heic|heif|bmp|tiff|tif|ico|woff2?|ttf|eot|otf|css|map|pdf|mp4|webm|ogv|mov|m4v|mp3|wav|ogg|m4a|opus|flac|aac)(\?|$)/i,
 ];
 
 function isStaticAsset(requestPath) {
