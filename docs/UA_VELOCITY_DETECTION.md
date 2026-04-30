@@ -120,7 +120,14 @@ A request is blocked if ALL:
 3. `trustedIpTracker[ipKey]` has no `lastGoodAction` in the last 24h
 4. `UA_VELOCITY_ENFORCE === true`
 
-On each block the IP+UA pair accumulates a **strike**. On the **3rd strike in 24h** (default, via `UA_VELOCITY_STRIKES_FOR_BAN`), the IP is **permanently banned** via the existing `banIP()` infrastructure (30-day ban persisted to `banned-ips.json`).
+On each block the IP+UA pair accumulates a **strike**, subject to two FP-safety guards:
+
+1. **Distinct paths only** — same path repeated (refresh, browser retry, asset re-fetch) does not increment.
+2. **Min interval `UA_VELOCITY_MIN_STRIKE_INTERVAL` (default 30s)** — strikes within the cooldown after the previous one are dropped.
+
+These guards prevent the parallel-fetch FP that previously permabanned real users in <20ms: when a flagged-UA user clicked one link, the browser fanned out HTML + sprite SVGs in parallel, each of which counted as a strike. With the guards, only one strike per click can land. (Note: the underlying static-asset list now also catches top-level `*.svg|.png|.css|.woff2|...` so most asset fetches don't reach strike accounting at all — defense in depth.)
+
+On the **3rd strike in 24h** (default, via `UA_VELOCITY_STRIKES_FOR_BAN`), the IP is **permanently banned** via the existing `banIP()` infrastructure (30-day ban persisted to `banned-ips.json`).
 
 **Response codes:**
 - Strikes 1–2: `HTTP 429`, `Retry-After: 300`, `X-Blocked-Reason: ua_velocity`, `X-Robots-Tag: noindex, nofollow`. HTML has a **manual** "Go to homepage" button — no auto-redirect (see note below).
@@ -152,6 +159,7 @@ On each block the IP+UA pair accumulates a **strike**. On the **3rd strike in 24
 | `UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY` | `40` | Tier B. |
 | `UA_VELOCITY_STRIKES_FOR_BAN` | `3` | Strikes by same IP+UA pair in window → permaban. |
 | `UA_VELOCITY_STRIKE_WINDOW` | `86400000` (24h) | Rolling window for counting strikes. |
+| `UA_VELOCITY_MIN_STRIKE_INTERVAL` | `30000` (30s) | Min gap between countable strikes. Combined with distinct-path requirement, prevents single-page-load fan-out from racking up strikes. |
 
 ---
 
@@ -228,4 +236,28 @@ Log lines emitted to `blocked-YYYY-MM-DD.log` and stdout:
 
 ## Known FP cases
 
-_None yet. Append dated entries here whenever a real-user complaint or trusted-IP analysis surfaces collateral damage._
+### 2026-04-30 — single-page-load parallel-fetch permaban (RESOLVED)
+
+**Symptom**: Three users complained of permabans overnight (NZ Spark `121.79.208.97` ~1 AM CEST hitting `/en/puzzle-add`; FR Free user `88.126.179.230` aka account #MAMATT ~0:04 CEST; one anonymous ~3 AM CEST). All three were real users on flagged Chrome UAs.
+
+**Root cause**: Two compounding bugs.
+
+1. `STATIC_ASSET_PATTERNS` did not match top-level sprite SVGs (`/rank-icons-sprite.svg`, `/stat-icons-sprite.svg`, `/difficulty-icons-sprite.svg`). The site fetches all three on every HTML page via parallel HTTP requests. Each one fell through into UA-velocity strike accounting.
+2. `recordUaVelocityStrike` had no path-dedup or min-interval guard. A single click that fanned into HTML + 2-3 sprite fetches accumulated 3 strikes inside ~20 ms → instant permaban with no recovery path.
+
+Forensic evidence for `121.79.208.97`: Strike 1 at `22:25:06.271Z` on `/en/player-profile/UUID`, ban event 17 ms later at `22:25:06.288Z` on `/rank-icons-sprite.svg`. The sprite fetch was treated as a billable HTML request because it didn't match any static-asset pattern.
+
+Across all of April, 1682 IPs were permabanned via UA velocity (3 strikes); the path-count distribution showed p50 = 8 paths and p90 = 13 — the same range a single page load + a couple of follow-up clicks would produce. The bug was systemic.
+
+**Remediation**:
+- Mass-unban: removed all 2011 UA-velocity 3-strike entries from `banned-ips.json` (kept the 10 locale/page-scrape bans). Audit log saved to `unbanned-uavelocity-<TS>.json` in the log dir.
+- Cleared `flagged-uas.json` so unbanned IPs don't immediately re-strike.
+- Added `/^\/[^/?]+\.(svg|png|jpg|jpeg|gif|webp|ico|woff2?|ttf|eot|otf|css|map)(\?|$)/i` to `STATIC_ASSET_PATTERNS` — generic top-level static-extension match.
+- Reshaped `uaVelocityStrikes` map values from `[ts, ts, ...]` to `[{ts, path}, ...]`. Strikes only count when path is distinct from prior strikes AND `now - lastStrike.ts >= UA_VELOCITY_MIN_STRIKE_INTERVAL` (default 30s).
+
+**Why all three guards matter (defense in depth)**:
+- Static-asset match: prevents most asset fetches from reaching strike accounting at all.
+- Distinct-path: catches anything that slips past (browser retries, polling endpoints).
+- Min-interval: catches anything that gets past both (genuine concurrent navigation).
+
+A real user can no longer be permabanned from a single page load. Bots that make many requests over time across distinct paths still get banned — the actual scraper signal is preserved.

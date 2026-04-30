@@ -49,6 +49,11 @@ const TRUSTED_IP_TTL = parseInt(process.env.TRUSTED_IP_TTL, 10) || 6 * 60 * 60 *
 // Real users who trip once recover via homepage trust-marker before striking again.
 const UA_VELOCITY_STRIKES_FOR_BAN = parseInt(process.env.UA_VELOCITY_STRIKES_FOR_BAN, 10) || 3;
 const UA_VELOCITY_STRIKE_WINDOW = parseInt(process.env.UA_VELOCITY_STRIKE_WINDOW, 10) || 24 * 60 * 60 * 1000;
+// Minimum gap between strikes that count toward permaban. Without this, a single
+// page load that fetches HTML + a few sibling requests in parallel can permaban
+// a real user in <20ms (parallel-fetch FP). 30s ensures strikes only accrue from
+// genuinely separate user actions, not from one click that fans out concurrent requests.
+const UA_VELOCITY_MIN_STRIKE_INTERVAL = parseInt(process.env.UA_VELOCITY_MIN_STRIKE_INTERVAL, 10) || 30 * 1000;
 
 // =============================================================================
 // STATIC ASSET PATTERNS (excluded from rate limiting)
@@ -71,6 +76,12 @@ const STATIC_ASSET_PATTERNS = [
   /^\/apple/i,
   /^\/mstile/i,
   /^\/safari/i,
+  // Top-level sprite/static files fetched alongside HTML pages — must NOT
+  // hit UA-velocity strike accounting. A single page load fetches HTML +
+  // /rank-icons-sprite.svg + /stat-icons-sprite.svg + /difficulty-icons-sprite.svg
+  // in parallel; before this, that racked up 3 strikes in <20ms and permabanned
+  // real users on first click. Matches root-level files with static extensions.
+  /^\/[^/?]+\.(svg|png|jpg|jpeg|gif|webp|ico|woff2?|ttf|eot|otf|css|map)(\?|$)/i,
 ];
 
 function isStaticAsset(requestPath) {
@@ -879,15 +890,33 @@ const trustedIpTracker = new Map();  // ipKey -> { lastGoodAction }
 
 // Strike tracker keyed on IP+UA so a real user sharing a CGNAT IP with a
 // different UA isn't ever struck because of someone else's bot.
-const uaVelocityStrikes = new Map();  // "ip|ua" -> [timestamp, ...]
+// Each strike records {ts, path} so we can dedupe by path and require a
+// minimum interval between strikes — both are FP safety nets against the
+// "single page load = 3 parallel asset fetches = permaban" failure mode.
+const uaVelocityStrikes = new Map();  // "ip|ua" -> [{ts, path}, ...]
 
-function recordUaVelocityStrike(ip, userAgent) {
+function recordUaVelocityStrike(ip, userAgent, requestPath) {
   const key = ip + '|' + userAgent;
   const now = Date.now();
   const strikes = uaVelocityStrikes.get(key) || [];
-  const recent = strikes.filter(ts => now - ts < UA_VELOCITY_STRIKE_WINDOW);
-  recent.push(now);
-  uaVelocityStrikes.set(key, recent);
+  const recent = strikes.filter(s => now - s.ts < UA_VELOCITY_STRIKE_WINDOW);
+
+  // Dedupe by path — a browser refetching the same URL or a retry doesn't
+  // count as a new strike. Forces strikes to come from genuinely distinct
+  // user actions.
+  const existingPaths = new Set(recent.map(s => s.path));
+  const isNewPath = !existingPaths.has(requestPath);
+
+  // Min-interval guard — even if path is new, drop strikes that arrive
+  // within UA_VELOCITY_MIN_STRIKE_INTERVAL of the previous one. Stops a
+  // single click from fanning into multiple strikes via parallel requests.
+  const lastStrike = recent.length > 0 ? recent[recent.length - 1] : null;
+  const tooSoon = lastStrike && (now - lastStrike.ts) < UA_VELOCITY_MIN_STRIKE_INTERVAL;
+
+  if (isNewPath && !tooSoon) {
+    recent.push({ ts: now, path: requestPath });
+    uaVelocityStrikes.set(key, recent);
+  }
   return { banned: recent.length >= UA_VELOCITY_STRIKES_FOR_BAN, strikes: recent.length };
 }
 
@@ -1084,7 +1113,7 @@ setInterval(() => {
 
   // Clean expired UA velocity strikes (same pattern as scrapeStrikes)
   for (const [key, strikes] of uaVelocityStrikes) {
-    const recent = strikes.filter(ts => now - ts < UA_VELOCITY_STRIKE_WINDOW);
+    const recent = strikes.filter(s => now - s.ts < UA_VELOCITY_STRIKE_WINDOW);
     if (recent.length === 0) uaVelocityStrikes.delete(key);
     else uaVelocityStrikes.set(key, recent);
   }
@@ -1448,7 +1477,7 @@ const server = http.createServer((req, res) => {
     if (shouldBlockByUaVelocity(userAgent, ipK, requestPath, req.method)) {
       const reason = 'UA velocity: same UA from many IPs with scraper signature';
       if (UA_VELOCITY_ENFORCE) {
-        const strike = recordUaVelocityStrike(ip, userAgent);
+        const strike = recordUaVelocityStrike(ip, userAgent, requestPath);
         if (strike.banned) {
           // Nth strike (default 3) — permaban the IP. Piggybacks existing banIP
           // infrastructure; persisted to banned-ips.json for 30 days.
@@ -1584,7 +1613,7 @@ server.listen(PORT, () => {
   console.log(`UA velocity Tier A: ${UA_VELOCITY_ENFORCE_MIN_IPS} IPs in ${UA_VELOCITY_WINDOW / 1000}s, uuidEntries>=${UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY}%`);
   console.log(`UA velocity Tier B shadow: ${UA_VELOCITY_SHADOW_MIN_IPS} IPs, uuidEntries>=${UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY}%`);
   console.log(`UA velocity flag TTL: ${UA_VELOCITY_FLAG_TTL / 1000}s; in-app browser exemptions: FBAN|FBAV|Instagram|MicroMessenger|Line|Snapchat|Twitter for iPhone`);
-  console.log(`UA velocity strikes for permaban: ${UA_VELOCITY_STRIKES_FOR_BAN} strikes in ${UA_VELOCITY_STRIKE_WINDOW / 1000 / 3600}h (keyed by IP+UA)`);
+  console.log(`UA velocity strikes for permaban: ${UA_VELOCITY_STRIKES_FOR_BAN} strikes in ${UA_VELOCITY_STRIKE_WINDOW / 1000 / 3600}h (keyed by IP+UA, distinct paths only, min ${UA_VELOCITY_MIN_STRIKE_INTERVAL / 1000}s between strikes)`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
   const flaggedCount = Array.from(uaVelocityTracker.values()).filter(r => r.flagged).length;
   console.log(`Flagged UAs loaded: ${flaggedCount}`);

@@ -41,7 +41,7 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 16. Allow → 200 OK
 
 **Key data structures in `server.js`:**
-- `STATIC_ASSET_PATTERNS` - regex array for paths excluded from rate limiting
+- `STATIC_ASSET_PATTERNS` - regex array for paths excluded from all checks. Includes generic top-level static-extension match (`/foo.svg`, `/foo.png`, `/foo.css` etc.) so sprite SVGs fetched alongside HTML can't accumulate UA-velocity strikes. Without this, a single page load fanning out HTML + parallel sprite fetches permabans real users in <20ms.
 - `WHITELISTED_BOTS` - objects with `pattern` and `name` for search engine/social media bot whitelisting
 - `BLOCKED_PATHS` - objects with `pattern` and `reason` for malicious path detection
 - `BLOCKED_BOTS` - objects with `pattern` and `reason` for user agent blocking
@@ -117,5 +117,6 @@ Use `ipToInt()` to convert IP addresses. Source for ranges: https://github.com/i
 - `UA_VELOCITY_WINDOW` (600000 ms / 10 min) - rolling window for UA → IP aggregation
 - `UA_VELOCITY_FLAG_TTL` (86400000 ms / 24h) - flag expires after this long without re-fire; matches `TRUSTED_IP_TTL` so active attacks stay flagged across dormant periods
 - `TRUSTED_IP_TTL` (21600000 ms / 6h) - trust window per IP; refreshed on every trust-marker hit AND every trusted-IP bypass so active users stay trusted indefinitely; idle IPs lose trust so residential proxies can't inherit overnight real-user trust
+- `UA_VELOCITY_MIN_STRIKE_INTERVAL` (30000 ms / 30s) - minimum gap between strikes that count toward permaban; combined with the distinct-path requirement in `recordUaVelocityStrike`, prevents a single page load from racking up 3 strikes via parallel asset fetches (the bug that permabanned real users in <20ms before being caught)
 - `UA_VELOCITY_ENFORCE_MIN_IPS` (40), `UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES` (30), `UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS` (20), `UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT` (10), `UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY` (50) - Tier A (enforces blocks)
 - `UA_VELOCITY_SHADOW_MIN_IPS` (25), `UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES` (20), `UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS` (15), `UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT` (5), `UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY` (40) - Tier B (log-only, stricter)
