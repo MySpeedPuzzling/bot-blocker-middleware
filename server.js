@@ -702,47 +702,15 @@ function checkLocaleSwitch(ip, requestPath) {
 // CHROME VERSION SPAN DETECTION (catches UA rotation bots)
 // =============================================================================
 
-const CHROME_SPAN_WINDOW = 10 * 60 * 1000;  // 10 minutes
-const CHROME_SPAN_THRESHOLD = 10;            // version difference that triggers block
-const chromeVersionTracker = new Map();      // ip -> { minVersion, maxVersion, windowStart }
-
-/**
- * Detects UA rotation bots by tracking Chrome version spread per IP.
- * Bots rotate: Chrome/103, Chrome/111, Chrome/146 (span = 43 → blocked).
- * Real users at competition: all have Chrome/145-146 (span = 1 → allowed).
- * Chrome auto-updates enforce version convergence on same network.
- */
-function checkChromeVersionSpan(ip, userAgent) {
-  if (!userAgent) return false;
-
-  // Only track Windows 10 + Chrome user agents
-  const match = userAgent.match(/Windows NT 10\.0.*Chrome\/(\d+)\./);
-  if (!match) return false;
-
-  const version = parseInt(match[1], 10);
-  const now = Date.now();
-
-  if (!chromeVersionTracker.has(ip)) {
-    chromeVersionTracker.set(ip, { minVersion: version, maxVersion: version, windowStart: now });
-    return false;
-  }
-
-  const record = chromeVersionTracker.get(ip);
-
-  // Reset window if expired
-  if (now - record.windowStart > CHROME_SPAN_WINDOW) {
-    record.minVersion = version;
-    record.maxVersion = version;
-    record.windowStart = now;
-    return false;
-  }
-
-  // Update min/max
-  if (version < record.minVersion) record.minVersion = version;
-  if (version > record.maxVersion) record.maxVersion = version;
-
-  return (record.maxVersion - record.minVersion) >= CHROME_SPAN_THRESHOLD;
-}
+// Chrome version span check was removed 2026-04-30: it permabanned a real
+// user who restarted their PC and the OS reopened the tab in a different
+// browser than usual (different Chrome version). On shared WiFi (cafes,
+// offices, conferences, NAT) many users share one IP and routinely span
+// 10+ Chrome versions across Chrome + Edge + stale Electron app bundles
+// (Slack/Discord/VS Code lag 4-6 versions behind). The rule cannot
+// distinguish "many users on one IP" from "one bot rotating UAs" without
+// per-user fingerprinting we don't have. Actual bot rotation is caught
+// by UA velocity (per-UA aggregation), HTTP/1.1 browser, and rate limit.
 
 // =============================================================================
 // PAGE SCRAPING DETECTION (puzzle/profile pages)
@@ -1067,12 +1035,6 @@ setInterval(() => {
     }
   }
 
-  // Clean chrome version span tracker
-  for (const [key, record] of chromeVersionTracker) {
-    if (now - record.windowStart > CHROME_SPAN_WINDOW * 2) {
-      chromeVersionTracker.delete(key);
-    }
-  }
 
   // Clean page scraping trackers
   for (const [key, record] of puzzleScrapeTracker) {
@@ -1515,18 +1477,11 @@ const server = http.createServer((req, res) => {
     }
   }
 
-  // Check Chrome version span (UA rotation detection)
-  if (checkChromeVersionSpan(ip, userAgent)) {
-    const reason = 'UA rotation detected: multiple Chrome versions from same IP';
-    logBlocked('ua_rotation', ip, userAgent, reason, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
-    res.writeHead(403, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'X-Blocked-Reason': 'ua_rotation',
-    });
-    res.end(html);
-    return;
-  }
+  // (Chrome version span / UA rotation check removed 2026-04-30 — see comment
+  // at the former checkChromeVersionSpan definition site. Shared-IP NAT
+  // routinely produces 10+ Chrome version spans from many real users, and
+  // the rule had no way to tell that apart from bot rotation. UA velocity +
+  // HTTP/1.1 browser + rate limit cover the actual rotation case.)
 
   // Check locale switching (may trigger permanent ban)
   if (checkLocaleSwitch(ip, requestPath)) {
@@ -1611,7 +1566,6 @@ server.listen(PORT, () => {
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
-  console.log(`Chrome version span: threshold=${CHROME_SPAN_THRESHOLD} versions, window=${CHROME_SPAN_WINDOW / 1000}s`);
   console.log(`Cloud botnet CIDR ranges: ${CLOUD_PROVIDER_CIDRS.length} (requires X-Original-Protocol header)`);
   console.log(`UA velocity enforce: ${UA_VELOCITY_ENFORCE ? 'ON' : 'OFF (dry-run)'}`);
   console.log(`UA velocity Tier A: ${UA_VELOCITY_ENFORCE_MIN_IPS} IPs in ${UA_VELOCITY_WINDOW / 1000}s, uuidEntries>=${UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY}%`);

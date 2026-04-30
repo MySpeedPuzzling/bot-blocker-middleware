@@ -34,7 +34,7 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 9. Cloud botnet check → 403 for HTTP/1.1 + browser UA + cloud provider IPs (requires Traefik plugin)
 10. HTTP/1.1 browser check → 403 for HTTP/1.1 + Chrome/Firefox UA from any IP (real browsers use HTTP/2+)
 11. **UA velocity check** → 429 when same UA is shared by many IPs with a scraper signature (residential-proxy botnet). Trusted IPs + trust-marker paths bypass. See [`docs/UA_VELOCITY_DETECTION.md`](docs/UA_VELOCITY_DETECTION.md).
-12. Chrome version span check → 403 if same IP sends 3+ Chrome versions spanning 10+ apart in 10 min
+12. ~~Chrome version span check~~ — **removed 2026-04-30**: shared-IP NAT (cafes/offices/conferences) routinely produces 10+ Chrome version spans across many real users (Chrome + Edge + stale Electron app bundles like Slack/Discord/VS Code). Could not distinguish that from bot rotation without per-user fingerprinting. Coverage now provided by UA velocity (per-UA aggregation), HTTP/1.1 browser, and rate limit.
 13. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
 14. Page scraping check → 429/403 for rapid puzzle/profile page scraping (IP+UA keyed)
 15. Rate limiting → 429 if IP+UA exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
@@ -50,12 +50,10 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 - `isChineseBotnet()` - detects 43.x + Windows 10 + Chrome (any version)
 - `isCloudBotnet()` - detects cloud IP + HTTP/1.1 + browser UA (requires X-Original-Protocol header)
 - `isHTTP1Browser()` - detects HTTP/1.1 + Chrome/Firefox UA from any IP (real browsers always use HTTP/2+)
-- `checkChromeVersionSpan()` - detects UA rotation by tracking Chrome version spread per IP
 - `isFakeIOSBot()` - detects 43.x + ancient iOS user agents
 - `requests` Map - in-memory rate limit tracking per IP+UA
 - `bannedIPs` Map - persisted permanent bans (loaded from `banned-ips.json`)
 - `localeTracker` Map - in-memory locale switching detection per IP
-- `chromeVersionTracker` Map - tracks min/max Chrome versions per IP for rotation detection
 - `uaVelocityTracker` Map - tracks UA → {ips, uuidEntries, homepageVisits, uniqueUuidPaths, flagged, flaggedAt} for residential-proxy botnet detection. Flag state is carried across window rolls, kept-alive on each block, and persisted to `flagged-uas.json` so a flagged UA survives window resets, attack pauses within FLAG_TTL, and container restarts
 - `trustedIpTracker` Map - 24h tracker of IPs that hit a trust-marker path (homepage/listing/login/POST); bypasses UA velocity blocks
 - `updateUaVelocity()` / `shouldBlockByUaVelocity()` / `isTrustMarkerRequest()` / `markIpTrusted()` / `ipKey()` - UA velocity helpers (see `docs/UA_VELOCITY_DETECTION.md`)
