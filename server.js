@@ -18,7 +18,6 @@ const LOCALE_MIN_HITS = parseInt(process.env.LOCALE_MIN_HITS, 10) || 3;         
 const LOCALE_WINDOW = parseInt(process.env.LOCALE_WINDOW, 10) || 60000;         // 1 minute
 const BAN_DURATION = parseInt(process.env.BAN_DURATION, 10) || 30 * 24 * 60 * 60 * 1000; // 30 days
 const BANNED_IPS_FILE = path.join(LOG_DIR, 'banned-ips.json');
-const FLAGGED_UAS_FILE = path.join(LOG_DIR, 'flagged-uas.json');
 
 // Page scraping detection (puzzle/profile pages) — windows in seconds
 const PUZZLE_SCRAPE_THRESHOLD = parseInt(process.env.PUZZLE_SCRAPE_THRESHOLD, 10) || 40;
@@ -28,32 +27,6 @@ const PROFILE_SCRAPE_WINDOW = (parseInt(process.env.PROFILE_SCRAPE_WINDOW, 10) |
 const SCRAPE_STRIKES_FOR_BAN = parseInt(process.env.SCRAPE_STRIKES_FOR_BAN, 10) || 3;
 const SCRAPE_STRIKE_WINDOW = (parseInt(process.env.SCRAPE_STRIKE_WINDOW, 10) || 86400) * 1000;  // 86400s = 24h
 
-// UA velocity detection (residential-proxy botnet) — see docs/UA_VELOCITY_DETECTION.md
-const UA_VELOCITY_ENFORCE = (process.env.UA_VELOCITY_ENFORCE || 'true').toLowerCase() !== 'false';
-const UA_VELOCITY_WINDOW = parseInt(process.env.UA_VELOCITY_WINDOW, 10) || 10 * 60 * 1000;       // 10 min rolling window
-const UA_VELOCITY_FLAG_TTL = parseInt(process.env.UA_VELOCITY_FLAG_TTL, 10) || 24 * 60 * 60 * 1000;   // 24h: flag survives attack pauses and deploys without re-opening cold-start grace window
-// Tier A — enforced (conservative, low FP risk)
-const UA_VELOCITY_ENFORCE_MIN_IPS            = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_IPS, 10) || 40;
-const UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES   = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES, 10) || 30;
-const UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS   = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS, 10) || 20;
-const UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT   = parseInt(process.env.UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT, 10) || 10;
-const UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY = parseInt(process.env.UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY, 10) || 50;
-// Tier B — shadow (stricter, logs only, never blocks)
-const UA_VELOCITY_SHADOW_MIN_IPS            = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_IPS, 10) || 25;
-const UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES   = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES, 10) || 20;
-const UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS   = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS, 10) || 15;
-const UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT   = parseInt(process.env.UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT, 10) || 5;
-const UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY = parseInt(process.env.UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY, 10) || 40;
-const TRUSTED_IP_TTL = parseInt(process.env.TRUSTED_IP_TTL, 10) || 6 * 60 * 60 * 1000; // 6h — shorter window so residential-proxy IPs can't inherit overnight trust. Active users get refreshed on every bypass, so real browsing sessions stay trusted indefinitely.
-// Strike-based permaban: IP+UA combo accumulating N strikes in 24h = permaban.
-// Real users who trip once recover via homepage trust-marker before striking again.
-const UA_VELOCITY_STRIKES_FOR_BAN = parseInt(process.env.UA_VELOCITY_STRIKES_FOR_BAN, 10) || 3;
-const UA_VELOCITY_STRIKE_WINDOW = parseInt(process.env.UA_VELOCITY_STRIKE_WINDOW, 10) || 24 * 60 * 60 * 1000;
-// Minimum gap between strikes that count toward permaban. Without this, a single
-// page load that fetches HTML + a few sibling requests in parallel can permaban
-// a real user in <20ms (parallel-fetch FP). 30s ensures strikes only accrue from
-// genuinely separate user actions, not from one click that fans out concurrent requests.
-const UA_VELOCITY_MIN_STRIKE_INTERVAL = parseInt(process.env.UA_VELOCITY_MIN_STRIKE_INTERVAL, 10) || 30 * 1000;
 
 // =============================================================================
 // STATIC ASSET PATTERNS (excluded from rate limiting)
@@ -247,8 +220,8 @@ const BLOCKED_CIDRS = [
   // Baidu ASN 38365 — commercial crawler infrastructure, no real users
   { prefix: '220.181.', reason: 'Baidu crawler ASN (commercial infra, no real users)' },
   // Indonesian residential-proxy botnet subnet — 121+ distinct IPs observed in
-  // 8h post-deploy all sharing the same fake Chrome/133.0.6943.141 UA hitting
-  // Japanese-locale UUID pages. Caught by UA velocity; block upstream to save CPU.
+  // 8h all sharing the same fake Chrome/133.0.6943.141 UA hitting Japanese-locale
+  // UUID pages.
   { prefix: '202.46.62.', reason: 'Indonesian residential-proxy botnet subnet (fake Chrome/133 UA farm)' },
 ];
 
@@ -577,50 +550,6 @@ function banIP(ip, reason, locales) {
   console.log(`[BAN] Permanently banned ${ip}: ${reason}`);
 }
 
-function loadFlaggedUAs() {
-  try {
-    if (!fs.existsSync(FLAGGED_UAS_FILE)) return;
-    const data = JSON.parse(fs.readFileSync(FLAGGED_UAS_FILE, 'utf8'));
-    const now = Date.now();
-    let loaded = 0;
-    for (const item of data) {
-      const flaggedAt = new Date(item.flaggedAt).getTime();
-      if (isNaN(flaggedAt)) continue;
-      // Only restore flags still within TTL; keep-alive will re-extend on active attacks.
-      if (now - flaggedAt >= UA_VELOCITY_FLAG_TTL) continue;
-      uaVelocityTracker.set(item.ua, {
-        ips: new Set(),
-        uuidEntries: 0,
-        homepageVisits: 0,
-        uniqueUuidPaths: new Set(),
-        windowStart: now,
-        flagged: true,
-        flaggedAt,
-        shadowLogged: false,
-      });
-      loaded++;
-    }
-    if (loaded > 0) console.log(`[UA_VELOCITY] Restored ${loaded} active flagged UAs from ${FLAGGED_UAS_FILE}`);
-  } catch (err) {
-    console.error('[UA_VELOCITY] Failed to load flagged UAs:', err.message);
-  }
-}
-
-function saveFlaggedUAs() {
-  try {
-    const now = Date.now();
-    const data = [];
-    for (const [ua, rec] of uaVelocityTracker) {
-      if (rec.flagged && now - rec.flaggedAt < UA_VELOCITY_FLAG_TTL) {
-        data.push({ ua, flaggedAt: new Date(rec.flaggedAt).toISOString() });
-      }
-    }
-    fs.writeFileSync(FLAGGED_UAS_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('[UA_VELOCITY] Failed to save flagged UAs:', err.message);
-  }
-}
-
 function isPermanentlyBanned(ip) {
   if (!bannedIPs.has(ip)) return false;
 
@@ -697,20 +626,6 @@ function checkLocaleSwitch(ip, requestPath) {
 
   return false;
 }
-
-// =============================================================================
-// CHROME VERSION SPAN DETECTION (catches UA rotation bots)
-// =============================================================================
-
-// Chrome version span check was removed 2026-04-30: it permabanned a real
-// user who restarted their PC and the OS reopened the tab in a different
-// browser than usual (different Chrome version). On shared WiFi (cafes,
-// offices, conferences, NAT) many users share one IP and routinely span
-// 10+ Chrome versions across Chrome + Edge + stale Electron app bundles
-// (Slack/Discord/VS Code lag 4-6 versions behind). The rule cannot
-// distinguish "many users on one IP" from "one bot rotating UAs" without
-// per-user fingerprinting we don't have. Actual bot rotation is caught
-// by UA velocity (per-UA aggregation), HTTP/1.1 browser, and rate limit.
 
 // =============================================================================
 // PAGE SCRAPING DETECTION (puzzle/profile pages)
@@ -808,191 +723,6 @@ function checkPageScraping(ip, userAgent, requestPath) {
 }
 
 // =============================================================================
-// UA VELOCITY DETECTION (residential-proxy botnet)
-// =============================================================================
-// Flags a UA when many distinct IPs share it in a short window AND those IPs
-// collectively show "content scraper" signature (UUID-direct entry, near-zero
-// homepage visits, each IP hitting a DIFFERENT UUID). Only blocks untrusted
-// IPs using the flagged UA — trusted IPs (those that have hit homepage/listing
-// within 24h) and trust-marker paths always pass through.
-// See docs/UA_VELOCITY_DETECTION.md for rationale.
-
-const FULL_UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
-
-// Social in-app browsers legitimately produce concentrated same-UA viral
-// traffic — exempt from velocity tracking entirely.
-// Positive-anchored to avoid matching TikTokSpider (already blocked).
-const IN_APP_BROWSER_RE = /FBAN|FBAV|Instagram|MicroMessenger|\bLine\/|Snapchat|Twitter for iPhone/i;
-
-// Trust markers — hitting any of these = real-user behavior evidence.
-const TRUST_MARKER_PATHS = [
-  /^\/$/,                                                 // root
-  /^\/(en|cs|de|es|fr|ja)\/?$/,                           // locale root
-  /^\/(en|cs|de|es|fr|ja)\/home\/?$/,                     // localized homepage
-  /^\/home\/?$/,                                          // bare homepage (no locale)
-  /^\/(en|cs|de|es|fr|ja)\/(puzzles|players|brands|blog|competitions|news|events|sale|manufacturers|shops|rankings|leaderboard|statistics|announcement|calendar)(\/|\?|$)/i,
-  /^\/(en|cs|de|es|fr|ja)\/(login|register|account|settings|profile-edit|logout|password)/i,
-  /^\/(login|register|account|settings|logout|password)(\/|\?|$)/i,  // bare auth paths (no locale)
-  /^\/puzzle-stopky\/?$/,                                 // stopwatch (CS root-relative landing)
-];
-
-function isUuidPath(p) { return FULL_UUID_RE.test(p); }
-function isInAppBrowser(ua) { return !!ua && IN_APP_BROWSER_RE.test(ua); }
-
-function isTrustMarkerRequest(requestPath, method) {
-  // Any POST/PUT/DELETE is strong real-user signal (bots rarely submit forms)
-  if (method && method !== 'GET' && method !== 'HEAD') return true;
-  for (const re of TRUST_MARKER_PATHS) if (re.test(requestPath)) return true;
-  return false;
-}
-
-// Collapse IPv6 to /64 prefix so one user's IPv6 rotation = one key.
-function ipKey(ip) {
-  if (!ip) return '';
-  if (!ip.includes(':')) return ip;
-  const parts = ip.split(':');
-  return parts.slice(0, 4).join(':');
-}
-
-const uaVelocityTracker = new Map();
-// UA -> { ips: Set<ipKey>, uuidEntries, homepageVisits, uniqueUuidPaths: Set,
-//         windowStart, flagged, flaggedAt, shadowLogged }
-
-const trustedIpTracker = new Map();  // ipKey -> { lastGoodAction }
-
-// Strike tracker keyed on IP+UA so a real user sharing a CGNAT IP with a
-// different UA isn't ever struck because of someone else's bot.
-// Each strike records {ts, path} so we can dedupe by path and require a
-// minimum interval between strikes — both are FP safety nets against the
-// "single page load = 3 parallel asset fetches = permaban" failure mode.
-const uaVelocityStrikes = new Map();  // "ip|ua" -> [{ts, path}, ...]
-
-function recordUaVelocityStrike(ip, userAgent, requestPath) {
-  const key = ip + '|' + userAgent;
-  const now = Date.now();
-  const strikes = uaVelocityStrikes.get(key) || [];
-  const recent = strikes.filter(s => now - s.ts < UA_VELOCITY_STRIKE_WINDOW);
-
-  // Dedupe by path — a browser refetching the same URL or a retry doesn't
-  // count as a new strike. Forces strikes to come from genuinely distinct
-  // user actions.
-  const existingPaths = new Set(recent.map(s => s.path));
-  const isNewPath = !existingPaths.has(requestPath);
-
-  // Min-interval guard — even if path is new, drop strikes that arrive
-  // within UA_VELOCITY_MIN_STRIKE_INTERVAL of the previous one. Stops a
-  // single click from fanning into multiple strikes via parallel requests.
-  const lastStrike = recent.length > 0 ? recent[recent.length - 1] : null;
-  const tooSoon = lastStrike && (now - lastStrike.ts) < UA_VELOCITY_MIN_STRIKE_INTERVAL;
-
-  if (isNewPath && !tooSoon) {
-    recent.push({ ts: now, path: requestPath });
-    uaVelocityStrikes.set(key, recent);
-  }
-  return { banned: recent.length >= UA_VELOCITY_STRIKES_FOR_BAN, strikes: recent.length };
-}
-
-function markIpTrusted(ipK) {
-  if (!ipK) return;
-  trustedIpTracker.set(ipK, { lastGoodAction: Date.now() });
-}
-
-function isTrustedIp(ipK) {
-  const rec = trustedIpTracker.get(ipK);
-  if (!rec) return false;
-  if (Date.now() - rec.lastGoodAction > TRUSTED_IP_TTL) {
-    trustedIpTracker.delete(ipK);
-    return false;
-  }
-  return true;
-}
-
-function updateUaVelocity(ua, ipK, requestPath, method) {
-  if (!ua || !ipK) return;
-  if (isInAppBrowser(ua)) return;  // exempt
-
-  const now = Date.now();
-  let rec = uaVelocityTracker.get(ua);
-  if (!rec || now - rec.windowStart > UA_VELOCITY_WINDOW) {
-    // Preserve flag across window rolls while within FLAG_TTL — otherwise
-    // each 10-min window reset gives the botnet a fresh grace period.
-    const carry = rec && rec.flagged && (now - rec.flaggedAt) < UA_VELOCITY_FLAG_TTL;
-    rec = {
-      ips: new Set(),
-      uuidEntries: 0,
-      homepageVisits: 0,
-      uniqueUuidPaths: new Set(),
-      windowStart: now,
-      flagged: carry,
-      flaggedAt: carry ? rec.flaggedAt : 0,
-      shadowLogged: false,
-    };
-    uaVelocityTracker.set(ua, rec);
-  }
-
-  if (!rec.ips.has(ipK)) {
-    rec.ips.add(ipK);
-    if (isTrustMarkerRequest(requestPath, method)) rec.homepageVisits++;
-    else if (isUuidPath(requestPath)) rec.uuidEntries++;
-  }
-  if (isUuidPath(requestPath)) rec.uniqueUuidPaths.add(requestPath);
-
-  // Tier A — enforce (integer math: pct gate is  a*100 vs b*PCT)
-  if (!rec.flagged
-      && rec.ips.size >= UA_VELOCITY_ENFORCE_MIN_IPS
-      && rec.uuidEntries >= UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES
-      && rec.uniqueUuidPaths.size >= UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS
-      && rec.homepageVisits * 100 < rec.ips.size * UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT
-      && rec.uniqueUuidPaths.size * 100 >= rec.ips.size * UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY) {
-    rec.flagged = true;
-    rec.flaggedAt = now;
-    const hp = Math.round(rec.homepageVisits * 100 / rec.ips.size);
-    const uu = Math.round(rec.uuidEntries * 100 / rec.ips.size);
-    const dv = Math.round(rec.uniqueUuidPaths.size * 100 / rec.ips.size);
-    console.log(`[UA_VELOCITY_FLAG] ips=${rec.ips.size} uuidEntries=${rec.uuidEntries} uniquePaths=${rec.uniqueUuidPaths.size} homepage=${hp}% uuid=${uu}% diversity=${dv}% UA=${ua.substring(0, 120)}`);
-    saveFlaggedUAs();
-  }
-
-  // Tier B — shadow (log only; fires once per window)
-  if (!rec.shadowLogged
-      && rec.ips.size >= UA_VELOCITY_SHADOW_MIN_IPS
-      && rec.uuidEntries >= UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES
-      && rec.uniqueUuidPaths.size >= UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS
-      && rec.homepageVisits * 100 < rec.ips.size * UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT
-      && rec.uniqueUuidPaths.size * 100 >= rec.ips.size * UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY) {
-    rec.shadowLogged = true;
-    const hp = Math.round(rec.homepageVisits * 100 / rec.ips.size);
-    const uu = Math.round(rec.uuidEntries * 100 / rec.ips.size);
-    const dv = Math.round(rec.uniqueUuidPaths.size * 100 / rec.ips.size);
-    console.log(`[UA_VELOCITY_SHADOW] ips=${rec.ips.size} uuidEntries=${rec.uuidEntries} uniquePaths=${rec.uniqueUuidPaths.size} homepage=${hp}% uuid=${uu}% diversity=${dv}% UA=${ua.substring(0, 120)}`);
-  }
-}
-
-function shouldBlockByUaVelocity(ua, ipK, requestPath, method) {
-  if (!ua || !ipK) return false;
-  if (isInAppBrowser(ua)) return false;
-  const rec = uaVelocityTracker.get(ua);
-  if (!rec || !rec.flagged) return false;
-  const now = Date.now();
-  if (now - rec.flaggedAt > UA_VELOCITY_FLAG_TTL) {
-    rec.flagged = false;
-    return false;
-  }
-  if (isTrustMarkerRequest(requestPath, method)) return false;  // never block recovery path
-  if (isTrustedIp(ipK)) {
-    // Refresh trust on every bypass: active real-user sessions stay trusted
-    // indefinitely; only IPs idle for >TRUSTED_IP_TTL lose trust (which kills
-    // residential-proxy trust-inheritance from overnight real-user sessions).
-    markIpTrusted(ipK);
-    return false;
-  }
-  // Keep-alive: extend flag as long as the attack keeps producing blockable requests.
-  // Without this the flag would TTL-expire every 10 min mid-attack.
-  rec.flaggedAt = now;
-  return true;
-}
-
-// =============================================================================
 // RATE LIMITING
 // =============================================================================
 
@@ -1058,31 +788,6 @@ setInterval(() => {
     }
   }
 
-  // Clean UA velocity tracker — but keep entries whose flag is still active
-  // so a dormant attack resuming doesn't get a fresh grace window.
-  for (const [ua, rec] of uaVelocityTracker) {
-    const flagAlive = rec.flagged && (now - rec.flaggedAt) < UA_VELOCITY_FLAG_TTL;
-    if (!flagAlive && now - rec.windowStart > UA_VELOCITY_WINDOW * 2) {
-      uaVelocityTracker.delete(ua);
-    }
-  }
-
-  // Persist keep-alive extensions so flagged UAs survive container restarts.
-  saveFlaggedUAs();
-
-  // Clean trusted IP tracker
-  for (const [k, rec] of trustedIpTracker) {
-    if (now - rec.lastGoodAction > TRUSTED_IP_TTL) {
-      trustedIpTracker.delete(k);
-    }
-  }
-
-  // Clean expired UA velocity strikes (same pattern as scrapeStrikes)
-  for (const [key, strikes] of uaVelocityStrikes) {
-    const recent = strikes.filter(s => now - s.ts < UA_VELOCITY_STRIKE_WINDOW);
-    if (recent.length === 0) uaVelocityStrikes.delete(key);
-    else uaVelocityStrikes.set(key, recent);
-  }
 }, 5 * 60 * 1000);
 
 // =============================================================================
@@ -1242,42 +947,6 @@ const BOT_BLOCKED_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-const UA_VELOCITY_BLOCKED_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="robots" content="noindex, nofollow">
-  <title>Please visit the homepage first</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
-    .card { background: white; border-radius: 16px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
-      max-width: 520px; width: 100%; padding: 48px 40px; text-align: center; }
-    .icon { font-size: 64px; margin-bottom: 24px; }
-    h1 { color: #1a202c; font-size: 24px; font-weight: 700; margin-bottom: 16px; }
-    p { color: #4a5568; font-size: 15px; line-height: 1.6; margin-bottom: 16px; text-align: left; }
-    a.home { display: inline-block; background: #667eea; color: white; padding: 12px 28px;
-      border-radius: 8px; text-decoration: none; font-weight: 600; margin-top: 8px; }
-    a.home:hover { background: #5a6fdc; }
-    .contact { background: #f7fafc; border-radius: 12px; padding: 16px; margin-top: 24px; font-size: 13px; color: #4a5568; }
-    .contact a { color: #667eea; text-decoration: none; font-weight: 600; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">&#128075;</div>
-    <h1>Just a moment</h1>
-    <p><strong>EN:</strong> Our protection thinks your visit looks unusual. Please click the button below to go to the homepage, then retry the page you wanted.</p>
-    <p><strong>CS:</strong> Naše ochrana si myslí, že vaše návštěva vypadá neobvykle. Klikněte prosím na tlačítko níže a otevřete hlavní stránku, pak zkuste znovu otevřít stránku, kterou jste chtěli.</p>
-    <a class="home" href="/">Go to homepage / Na hlavní stránku</a>
-    <div class="contact">If this keeps happening, please contact <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a>.</div>
-  </div>
-</body>
-</html>`;
-
 // =============================================================================
 // HTTP SERVER
 // =============================================================================
@@ -1432,57 +1101,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Check UA velocity (residential proxy botnet driving real Chromium)
-  // Updates the tracker first so the rule can self-trigger on the current request,
-  // then decides to block only if the UA is flagged AND IP is untrusted AND path
-  // is not a trust marker. See docs/UA_VELOCITY_DETECTION.md.
-  {
-    const ipK = ipKey(ip);
-    updateUaVelocity(userAgent, ipK, requestPath, req.method);
-    if (isTrustMarkerRequest(requestPath, req.method)) markIpTrusted(ipK);
-    if (shouldBlockByUaVelocity(userAgent, ipK, requestPath, req.method)) {
-      const reason = 'UA velocity: same UA from many IPs with scraper signature';
-      if (UA_VELOCITY_ENFORCE) {
-        const strike = recordUaVelocityStrike(ip, userAgent, requestPath);
-        if (strike.banned) {
-          // Nth strike (default 3) — permaban the IP. Piggybacks existing banIP
-          // infrastructure; persisted to banned-ips.json for 30 days.
-          banIP(ip, `UA velocity scraper signature (${strike.strikes} strikes)`, []);
-          logBlocked('ua_velocity_ban', ip, userAgent,
-            `Permaban on ${strike.strikes} UA velocity strikes`, requestPath);
-          const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g,
-            `Permanently banned: repeated UA velocity scraper signature (${strike.strikes} strikes)`);
-          res.writeHead(403, {
-            'Content-Type': 'text/html; charset=utf-8',
-            'X-Robots-Tag': 'noindex, nofollow',
-            'X-Blocked-Reason': 'ua_velocity_ban',
-          });
-          res.end(html);
-          return;
-        }
-        logBlocked('ua_velocity', ip, userAgent,
-          `Strike ${strike.strikes}/${UA_VELOCITY_STRIKES_FOR_BAN}: ${reason}`, requestPath);
-        res.writeHead(429, {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Retry-After': '300',
-          'X-Robots-Tag': 'noindex, nofollow',
-          'X-Blocked-Reason': 'ua_velocity',
-        });
-        res.end(UA_VELOCITY_BLOCKED_HTML);
-        return;
-      } else {
-        // Dry-run safety net (if operator flips UA_VELOCITY_ENFORCE=false)
-        console.log(`[UA_VELOCITY_WOULD_BLOCK] ${ip} ${requestPath} UA=${userAgent.substring(0, 100)}`);
-      }
-    }
-  }
-
-  // (Chrome version span / UA rotation check removed 2026-04-30 — see comment
-  // at the former checkChromeVersionSpan definition site. Shared-IP NAT
-  // routinely produces 10+ Chrome version spans from many real users, and
-  // the rule had no way to tell that apart from bot rotation. UA velocity +
-  // HTTP/1.1 browser + rate limit cover the actual rotation case.)
-
   // Check locale switching (may trigger permanent ban)
   if (checkLocaleSwitch(ip, requestPath)) {
     const info = bannedIPs.get(ip);
@@ -1551,15 +1169,6 @@ const server = http.createServer((req, res) => {
 
 ensureLogDir();
 loadBannedIPs();
-loadFlaggedUAs();
-
-// Persist UA velocity flags on shutdown so restarts don't reset flagged-bot state.
-const shutdownSave = () => {
-  try { saveFlaggedUAs(); } catch (_) { /* best-effort */ }
-  process.exit(0);
-};
-process.on('SIGTERM', shutdownSave);
-process.on('SIGINT', shutdownSave);
 
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
@@ -1567,14 +1176,7 @@ server.listen(PORT, () => {
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
   console.log(`Cloud botnet CIDR ranges: ${CLOUD_PROVIDER_CIDRS.length} (requires X-Original-Protocol header)`);
-  console.log(`UA velocity enforce: ${UA_VELOCITY_ENFORCE ? 'ON' : 'OFF (dry-run)'}`);
-  console.log(`UA velocity Tier A: ${UA_VELOCITY_ENFORCE_MIN_IPS} IPs in ${UA_VELOCITY_WINDOW / 1000}s, uuidEntries>=${UA_VELOCITY_ENFORCE_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_ENFORCE_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_ENFORCE_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_ENFORCE_MIN_PATH_DIVERSITY}%`);
-  console.log(`UA velocity Tier B shadow: ${UA_VELOCITY_SHADOW_MIN_IPS} IPs, uuidEntries>=${UA_VELOCITY_SHADOW_MIN_UUID_ENTRIES}, uniquePaths>=${UA_VELOCITY_SHADOW_MIN_UNIQUE_PATHS}, homepage<${UA_VELOCITY_SHADOW_MAX_HOMEPAGE_PCT}%, diversity>=${UA_VELOCITY_SHADOW_MIN_PATH_DIVERSITY}%`);
-  console.log(`UA velocity flag TTL: ${UA_VELOCITY_FLAG_TTL / 1000}s; in-app browser exemptions: FBAN|FBAV|Instagram|MicroMessenger|Line|Snapchat|Twitter for iPhone`);
-  console.log(`UA velocity strikes for permaban: ${UA_VELOCITY_STRIKES_FOR_BAN} strikes in ${UA_VELOCITY_STRIKE_WINDOW / 1000 / 3600}h (keyed by IP+UA, distinct paths only, min ${UA_VELOCITY_MIN_STRIKE_INTERVAL / 1000}s between strikes)`);
   console.log(`Banned IPs loaded: ${bannedIPs.size}`);
-  const flaggedCount = Array.from(uaVelocityTracker.values()).filter(r => r.flagged).length;
-  console.log(`Flagged UAs loaded: ${flaggedCount}`);
   console.log(`Whitelisted bot patterns: ${WHITELISTED_BOTS.length}`);
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
   console.log(`Blocked CIDR subnets: ${BLOCKED_CIDRS.length}`);

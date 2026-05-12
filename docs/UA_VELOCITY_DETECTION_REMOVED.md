@@ -1,4 +1,20 @@
-# UA Velocity Detection
+# UA Velocity Detection — REMOVED 2026-05-12
+
+> **Status: removed from `server.js` on 2026-05-12.** This document is kept for historical context only — it describes a rule that no longer exists in the codebase.
+>
+> **Why removed:** at scale, the rule flagged mainstream Chrome 133–145 user agents on Windows and Mac (plus Edge variants), i.e. the most common real-user browsers globally. Because Chrome's User-Agent Reduction (Chrome 110+) collapses every real user on a given Chrome version onto the **same UA string**, per-UA aggregation can't separate "many real users sharing a popular UA" from "a botnet rotating IPs under one UA." Once a popular puzzle was shared, real users entering on UUID pages with the same Chrome UA easily satisfied the "40+ IPs sharing a UA with UUID-entry + path diversity" signature.
+>
+> Observed damage on 2026-05-11 / 2026-05-12 before removal:
+> - **130k UA-velocity blocks/day** against **~115k distinct IPs** (i.e. mostly distinct real users, not concentrated bots).
+> - **309 permabans accumulated in <24h**, all real users with mainstream Chrome UAs.
+> - **11 flagged UAs** at time of removal, all mainstream Chrome/Edge versions, only one (Chrome/142 on Windows) plausibly bot-flavored.
+> - User complaints from real users denied as "bot" across multiple geographies (NZ, FR, IN, etc.).
+>
+> Three rounds of safeguards (parallel-fetch static-asset exclusion, distinct-path strike requirement, 30s min-strike interval) reduced the blast radius of each FP but did not address the underlying issue: the rule's premise — "real users don't produce a same-UA + UUID-entry signature across many IPs" — is wrong as soon as the site has organic global traffic on a popular UA.
+>
+> **Same failure mode as the Chrome version span rule** (removed 2026-04-30): aggregate behavioral signatures that share a key across many real users can't be the basis for blocking without per-session fingerprinting (JS challenge, JA4, etc.) — none of which we want to add.
+
+---
 
 Detects a single User-Agent string being shared by many distinct IPs in a short window **and** those IPs collectively exhibiting a "content scraper" behavioral signature. Blocks only new untrusted IPs using that UA.
 
