@@ -891,6 +891,21 @@ function hasValidPassCookie(cookieHeader, ip) {
 }
 
 /**
+ * Builds an ABSOLUTE redirect URL for the challenge 302s.
+ * Traefik resolves a relative Location against the AUTH SERVER's URL, so a
+ * relative redirect would send the browser to http://myspeedpuzzling-bot-
+ * blocker:3000/... (found in production verification). The public scheme and
+ * host arrive in the X-Forwarded-* headers forwardAuth always sends; the
+ * fallback keeps the relative URI for direct (non-Traefik) access like tests.
+ */
+function buildRedirectUrl(headers, cleanUri) {
+  const host = headers['x-forwarded-host'];
+  if (!host) return cleanUri;
+  const proto = headers['x-forwarded-proto'] || 'https';
+  return `${proto}://${host}${cleanUri}`;
+}
+
+/**
  * Extracts the challenge token from the forwarded URI.
  * Returns { token, cleanUri } (token param stripped, other params kept),
  * or null when no token is present.
@@ -1283,7 +1298,7 @@ const server = http.createServer(async (req, res) => {
         logChallenge('challenge_passed', ip, userAgent, 'Challenge solved', tokenReq.cleanUri);
         res.writeHead(302, {
           'Set-Cookie': makePassCookie(ip),
-          'Location': tokenReq.cleanUri,
+          'Location': buildRedirectUrl(req.headers, tokenReq.cleanUri),
           'Cache-Control': 'no-store',
         });
         res.end();
@@ -1292,7 +1307,10 @@ const server = http.createServer(async (req, res) => {
       logChallenge('challenge_failed', ip, userAgent, 'Token rejected by siteverify', tokenReq.cleanUri);
       // Redirect to the clean URL: the still-blocked client meets the
       // challenge page again there and can retry.
-      res.writeHead(302, { 'Location': tokenReq.cleanUri, 'Cache-Control': 'no-store' });
+      res.writeHead(302, {
+        'Location': buildRedirectUrl(req.headers, tokenReq.cleanUri),
+        'Cache-Control': 'no-store',
+      });
       res.end();
       return;
     }
@@ -1518,6 +1536,7 @@ server.listen(PORT, () => {
 // Exported for unit tests only — the module never gets required in production.
 module.exports = {
   signPassCookie,
+  buildRedirectUrl,
   makePassCookie,
   hasValidPassCookie,
   extractChallengeToken,

@@ -249,3 +249,24 @@ test('only UA-signature rules are challenge-eligible, named bots are not', () =>
   assert.ok(eligible.some(b => b.reason.includes('Presto')), 'Presto is eligible');
   assert.ok(eligible.some(b => b.reason.includes('Windows Vista')), 'impossible combos are eligible');
 });
+
+// -----------------------------------------------------------------------------
+// Redirect absolutization (Traefik resolves relative Location against the
+// AUTH SERVER url — production bug found 2026-08-01)
+// -----------------------------------------------------------------------------
+
+test('buildRedirectUrl absolutizes with forwarded proto+host', () => {
+  const { buildRedirectUrl } = mod();
+  const headers = { 'x-forwarded-host': 'myspeedpuzzling.com', 'x-forwarded-proto': 'https' };
+  assert.strictEqual(buildRedirectUrl(headers, '/en/puzzle?page=2'), 'https://myspeedpuzzling.com/en/puzzle?page=2');
+});
+
+test('buildRedirectUrl defaults proto to https', () => {
+  const { buildRedirectUrl } = mod();
+  assert.strictEqual(buildRedirectUrl({ 'x-forwarded-host': 'myspeedpuzzling.com' }, '/'), 'https://myspeedpuzzling.com/');
+});
+
+test('buildRedirectUrl falls back to relative without forwarded host', () => {
+  const { buildRedirectUrl } = mod();
+  assert.strictEqual(buildRedirectUrl({}, '/en/puzzle'), '/en/puzzle');
+});
