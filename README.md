@@ -65,6 +65,50 @@ labels:
 | `BAN_DURATION` | `2592000000`           | Ban duration in ms (30 days) |
 | `CONTACT_EMAIL` | `j.mikes@me.com`       | Contact email on block pages |
 | `LOG_DIR` | `/var/log/bot-blocker` | Log directory |
+| `TURNSTILE_SITE_KEY` | *(empty)* | Cloudflare Turnstile site key — challenge disabled while empty |
+| `TURNSTILE_SECRET_KEY` | *(empty)* | Turnstile secret key for siteverify |
+| `CHALLENGE_COOKIE_SECRET` | *(empty)* | HMAC secret signing the pass cookie |
+| `CHALLENGE_COOKIE_TTL_DAYS` | `7` | How long a solved challenge holds |
+| `CHALLENGE_VERIFY_LIMIT` | `5` | siteverify attempts per IP per minute |
+| `CHALLENGE_ENABLED` | `true` | Kill switch (`false` disables even with keys set) |
+
+## Human-Recovery Challenge (Cloudflare Turnstile)
+
+Heuristic rules that could plausibly catch a real human serve a **403 challenge
+page** (Turnstile widget) instead of a flat block. Solving it sets an
+HMAC-signed, **IP-bound** pass cookie (`__bb_pass`, default 7 days) and lifts
+any active permaban for that IP. The challenge auto-disables unless
+`TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY` and `CHALLENGE_COOKIE_SECRET` are
+all set — deploying without them changes nothing.
+
+**Challenge-eligible** (UA signatures real humans can hit via privacy tools /
+Opera Mini / anti-fingerprinting randomizers, plus the broad 43/8 combo and
+permaban pages):
+
+- Dead device (Nexus 5 / Android 6)
+- All "Impossible: OS + Chrome version" combos, fake Chrome 48, fake Opera Presto
+- Chinese cloud botnet combo (43.x + Windows 10 + Chrome)
+- Permanent-ban page (locale scraping, page-scraping strikes) — solving unbans
+
+**Never challenge-eligible:** named bots (GPTBot, ClaudeBot, SemrushBot, …),
+exploit paths (`wp-*`, `.env`, `.git`), curated botnet subnets, HeadlessChrome —
+and the **behavioral rules (rate limit, scrape strikes) are never bypassed by
+the cookie**: the challenge proves a human is present, not that the traffic
+volume is acceptable. A cookie holder who trips a behavioral ban gets challenged
+again; each solve costs the scraper another widget per exit IP.
+
+Flow (shaped by forwardAuth constraints — Traefik forwards request *headers*
+only, and returns our full response to the client on non-2xx):
+
+1. Eligible block → 403 challenge page at the original URL
+2. Solved widget reloads the same URL with `?__bb_token=<token>` (query string —
+   a POST body would never reach the middleware)
+3. Middleware verifies via siteverify (5s timeout, fails closed), replies
+   `302` + `Set-Cookie` back to the clean URL
+4. The cookie arrives in forwarded headers on every later request
+
+`challenge_passed` entries in the daily JSONL log are the **measured
+false-positive rate** of the challenge-eligible rules.
 
 ## Adding New Bot Patterns
 

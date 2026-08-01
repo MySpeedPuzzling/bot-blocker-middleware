@@ -1,6 +1,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // =============================================================================
 // CONFIGURATION
@@ -11,6 +12,27 @@ const LOG_DIR = process.env.LOG_DIR || '/var/log/bot-blocker';
 const PORT = process.env.PORT || 3000;
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT, 10) || 45;
 const RATE_WINDOW = parseInt(process.env.RATE_WINDOW, 10) || 60 * 1000; // 1 minute
+
+// Human-recovery challenge (Cloudflare Turnstile).
+// Heuristic rules that could plausibly catch a real human (UA-based signatures,
+// the 43/8 combo, permabans) serve a challenge page instead of a flat 403.
+// Solving it sets an HMAC-signed, IP-bound pass cookie and — if the IP was
+// permabanned — lifts the ban. Behavioral rules (rate limit, scrape strikes)
+// are NEVER bypassed by the cookie: a challenge proves a human is present,
+// not that the traffic volume is acceptable.
+// The challenge auto-disables (identical behavior to before) unless all three
+// secrets are configured, so deploying without env changes is a no-op.
+const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+// Overridable for tests (points at a local mock siteverify).
+const TURNSTILE_VERIFY_URL = process.env.TURNSTILE_VERIFY_URL || 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
+const CHALLENGE_COOKIE_SECRET = process.env.CHALLENGE_COOKIE_SECRET || '';
+const CHALLENGE_COOKIE_NAME = '__bb_pass';
+const CHALLENGE_TOKEN_PARAM = '__bb_token';
+const CHALLENGE_COOKIE_TTL_MS = (parseInt(process.env.CHALLENGE_COOKIE_TTL_DAYS, 10) || 7) * 24 * 60 * 60 * 1000;
+const CHALLENGE_VERIFY_LIMIT = parseInt(process.env.CHALLENGE_VERIFY_LIMIT, 10) || 5; // siteverify attempts per IP per minute
+const CHALLENGE_ENABLED = process.env.CHALLENGE_ENABLED !== 'false'
+  && TURNSTILE_SITE_KEY !== '' && TURNSTILE_SECRET_KEY !== '' && CHALLENGE_COOKIE_SECRET !== '';
 
 // Locale scraping detection
 const LOCALE_THRESHOLD = parseInt(process.env.LOCALE_THRESHOLD, 10) || 4;       // unique locales
@@ -168,18 +190,28 @@ const BLOCKED_BOTS = [
 
     // =========================================================================
     // FAKE/IMPOSSIBLE BROWSER SIGNATURES
+    //
+    // challenge: true — these match USER-AGENT STRINGS, not declared bot names,
+    // and the same strings are produced by privacy tools real humans run:
+    // UA-freezing browsers emit the dead-device string, anti-fingerprinting
+    // extensions randomize into impossible OS+version combos, and Opera Mini's
+    // proxy rendering still sends Presto. The signal stays (bots don't solve
+    // challenges); the humans get a way through. The two rules removed for
+    // mass-FPs (b447f35, bd52e3f) would have survived with this flag.
     // =========================================================================
 
     // Opera Presto engine discontinued in 2013 — all modern Opera uses Chromium
-    { pattern: /Presto\/\d/i, reason: 'Fake Opera bot (Presto engine discontinued 2013)' },
+    { pattern: /Presto\/\d/i, reason: 'Fake Opera bot (Presto engine discontinued 2013)', challenge: true },
 
     // Exact bot fingerprint: Chrome 48.0.2564.116 (Jan 2016) shared across 56+ Chinese IPs
     // No real user runs Chrome 48 in 2026; WOW64 (32-bit on 64-bit) is also very rare
-    { pattern: /Chrome\/48\.0\.2564\.116/, reason: 'Fake Chrome 48 bot signature (shared across many CN IPs)' },
+    { pattern: /Chrome\/48\.0\.2564\.116/, reason: 'Fake Chrome 48 bot signature (shared across many CN IPs)', challenge: true },
 
     // Nexus 5 was discontinued in 2015, Android 6.0 (Marshmallow) EOL 2018
-    // No real user on a 10-year-old phone with EOL OS in 2026
-    { pattern: /Android 6\.0; Nexus 5 Build/i, reason: 'Dead device (Nexus 5 discontinued 2015, Android 6 EOL 2018)' },
+    // No real user on a 10-year-old phone with EOL OS in 2026 — but privacy
+    // tools DO freeze UAs on exactly this string (24k distinct IPs / 8 days,
+    // ~1 block per IP: proxy rotation with possible humans hidden inside)
+    { pattern: /Android 6\.0; Nexus 5 Build/i, reason: 'Dead device (Nexus 5 discontinued 2015, Android 6 EOL 2018)', challenge: true },
 
     // =========================================================================
     // IMPOSSIBLE BROWSER COMBINATIONS (verified safe)
@@ -188,18 +220,18 @@ const BLOCKED_BOTS = [
     // Windows 7 (NT 6.1) + Chrome 110+ is impossible
     // Chrome 109 was the LAST version supporting Windows 7 (February 2023)
     // Source: Google officially ended support
-    { pattern: /Windows NT 6\.1.*Chrome\/1[1-9][0-9]\./i, reason: 'Impossible: Windows 7 + Chrome 110+ (support ended Feb 2023)' },
-    { pattern: /Windows NT 6\.1.*Chrome\/[2-9][0-9]{2}\./i, reason: 'Impossible: Windows 7 + Chrome 200+' },
+    { pattern: /Windows NT 6\.1.*Chrome\/1[1-9][0-9]\./i, reason: 'Impossible: Windows 7 + Chrome 110+ (support ended Feb 2023)', challenge: true },
+    { pattern: /Windows NT 6\.1.*Chrome\/[2-9][0-9]{2}\./i, reason: 'Impossible: Windows 7 + Chrome 200+', challenge: true },
 
     // Windows Vista (NT 6.0) + Chrome 50+ is impossible
     // Chrome 49 was the LAST version supporting Vista (April 2016)
-    { pattern: /Windows NT 6\.0.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows Vista + Chrome 50+' },
-    { pattern: /Windows NT 6\.0.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows Vista + Chrome 100+' },
+    { pattern: /Windows NT 6\.0.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows Vista + Chrome 50+', challenge: true },
+    { pattern: /Windows NT 6\.0.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows Vista + Chrome 100+', challenge: true },
 
     // Windows XP (NT 5.1) + Chrome 50+ is impossible
     // Chrome 49 was the LAST version supporting XP (April 2016)
-    { pattern: /Windows NT 5\.1.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows XP + Chrome 50+' },
-    { pattern: /Windows NT 5\.1.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows XP + Chrome 100+' },
+    { pattern: /Windows NT 5\.1.*Chrome\/[5-9][0-9]\./i, reason: 'Impossible: Windows XP + Chrome 50+', challenge: true },
+    { pattern: /Windows NT 5\.1.*Chrome\/1[0-9]{2}\./i, reason: 'Impossible: Windows XP + Chrome 100+', challenge: true },
 ];
 
 // =============================================================================
@@ -788,7 +820,174 @@ setInterval(() => {
     }
   }
 
-}, 5 * 60 * 1000);
+  // Clean challenge verify-attempt records
+  for (const [ip, record] of verifyAttempts) {
+    if (now - record.windowStart > 120000) {
+      verifyAttempts.delete(ip);
+    }
+  }
+
+}, 5 * 60 * 1000).unref(); // unref: don't hold the process open (tests require this module)
+
+// =============================================================================
+// HUMAN-RECOVERY CHALLENGE (Cloudflare Turnstile)
+//
+// Flow (forwardAuth constraints baked in — Traefik forwards request HEADERS
+// only, never bodies, and returns our full response to the client on non-2xx):
+//   1. A challenge-eligible rule serves the 403 challenge page at the ORIGINAL
+//      URL (forwardAuth renders our body at the URL the user requested).
+//   2. The solved widget reloads the same URL with ?__bb_token=<token> —
+//      query string because it survives in X-Forwarded-Uri; a POST body would
+//      never reach us.
+//   3. We verify the token with siteverify, reply 302 + Set-Cookie (works on
+//      the deny path) back to the clean URL, and lift any permaban for the IP.
+//   4. The cookie arrives in forwarded headers on every later request and
+//      bypasses ONLY the challenge-eligible heuristics — never rate limits,
+//      never scrape detection, never the hard rules.
+//
+// Cookie format: "<expiresMs>.<hmac>" where hmac = HMAC-SHA256(secret,
+// "<ip>|<expiresMs>"). IP-bound: a shared/stolen cookie is worthless from
+// another address, and a rotating proxy pool has to solve per exit IP.
+// =============================================================================
+
+function signPassCookie(ip, expiresMs) {
+  return crypto.createHmac('sha256', CHALLENGE_COOKIE_SECRET)
+    .update(`${ip}|${expiresMs}`)
+    .digest('hex');
+}
+
+function makePassCookie(ip) {
+  const expiresMs = Date.now() + CHALLENGE_COOKIE_TTL_MS;
+  const value = `${expiresMs}.${signPassCookie(ip, expiresMs)}`;
+  const maxAgeSec = Math.floor(CHALLENGE_COOKIE_TTL_MS / 1000);
+  return `${CHALLENGE_COOKIE_NAME}=${value}; Max-Age=${maxAgeSec}; Path=/; Secure; HttpOnly; SameSite=Lax`;
+}
+
+function hasValidPassCookie(cookieHeader, ip) {
+  if (!cookieHeader) return false;
+
+  // Minimal cookie-header parse — find our cookie among the others
+  let raw = null;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === CHALLENGE_COOKIE_NAME) {
+      raw = part.slice(eq + 1).trim();
+      break;
+    }
+  }
+  if (!raw) return false;
+
+  const dot = raw.indexOf('.');
+  if (dot === -1) return false;
+
+  const expiresMs = parseInt(raw.slice(0, dot), 10);
+  if (!Number.isFinite(expiresMs) || Date.now() > expiresMs) return false;
+
+  const expected = signPassCookie(ip, expiresMs);
+  const actual = raw.slice(dot + 1);
+  if (actual.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+}
+
+/**
+ * Extracts the challenge token from the forwarded URI.
+ * Returns { token, cleanUri } (token param stripped, other params kept),
+ * or null when no token is present.
+ */
+function extractChallengeToken(requestPath) {
+  if (!requestPath.includes(CHALLENGE_TOKEN_PARAM)) return null;
+  let url;
+  try {
+    url = new URL(requestPath, 'http://internal');
+  } catch (e) {
+    return null;
+  }
+  const token = url.searchParams.get(CHALLENGE_TOKEN_PARAM);
+  if (!token) return null;
+  url.searchParams.delete(CHALLENGE_TOKEN_PARAM);
+  return { token, cleanUri: url.pathname + url.search };
+}
+
+/**
+ * Server-side verification against Turnstile siteverify.
+ * Tokens are single-use and expire after 5 minutes — replay is Cloudflare's
+ * problem, not ours. Fails CLOSED on network errors: the user just sees the
+ * challenge again and can retry.
+ */
+async function verifyTurnstileToken(token, ip) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  try {
+    const body = new URLSearchParams({
+      secret: TURNSTILE_SECRET_KEY,
+      response: token,
+      remoteip: ip,
+    });
+    const response = await fetch(TURNSTILE_VERIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: controller.signal,
+    });
+    if (!response.ok) return false;
+    const result = await response.json();
+    return result.success === true;
+  } catch (err) {
+    console.error(`[CHALLENGE] siteverify error: ${err.message}`);
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// siteverify attempts are rate-limited per IP so the verify endpoint cannot be
+// used to hammer Cloudflare (or burn CPU) with garbage tokens.
+const verifyAttempts = new Map();  // ip -> { count, windowStart }
+
+function isVerifyRateLimited(ip) {
+  const now = Date.now();
+  const record = verifyAttempts.get(ip);
+  if (!record || now - record.windowStart > 60000) {
+    verifyAttempts.set(ip, { count: 1, windowStart: now });
+    return false;
+  }
+  record.count++;
+  return record.count > CHALLENGE_VERIFY_LIMIT;
+}
+
+function logChallenge(event, ip, userAgent, detail, requestPath) {
+  // Same JSONL file as blocks — the daily summary picks the new types up
+  // automatically, and challenge_passed counts ARE the measured
+  // false-positive rate of the challenge-eligible rules.
+  logBlocked(event, ip, userAgent, detail, requestPath);
+}
+
+/**
+ * Serves the challenge page (403) for a challenge-eligible block, or the
+ * plain block page when the challenge is disabled. The block itself was
+ * already logged by the caller with its original type/reason — behavior
+ * stats stay comparable with pre-challenge history.
+ */
+function serveChallengeOrBlock(res, reason, headerReason) {
+  if (!CHALLENGE_ENABLED) {
+    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Blocked-Reason': headerReason,
+    });
+    res.end(html);
+    return;
+  }
+  const html = CHALLENGE_HTML.replace(/\{\{REASON\}\}/g, reason);
+  res.writeHead(403, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'X-Blocked-Reason': headerReason,
+    // The page must never be cached: it embeds a per-visit widget
+    'Cache-Control': 'no-store',
+  });
+  res.end(html);
+}
 
 // =============================================================================
 // HTML TEMPLATES
@@ -947,11 +1146,99 @@ const BOT_BLOCKED_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
+// Challenge page — served with 403 for challenge-eligible blocks. The widget
+// JS loads from Cloudflare's CDN (reachable — only OUR origin blocks the
+// client); on success the page reloads the SAME URL with the token appended
+// (this 403 body renders at the URL the user requested, so location.href IS
+// the original URL). No-JS clients still get the reason + contact fallback.
+const CHALLENGE_HTML = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <title>One more step</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      background: white;
+      border-radius: 16px;
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
+      max-width: 520px;
+      width: 100%;
+      padding: 48px 40px;
+      text-align: center;
+    }
+    .icon { font-size: 64px; margin-bottom: 24px; }
+    h1 { color: #1a202c; font-size: 24px; font-weight: 700; margin-bottom: 16px; }
+    p { color: #4a5568; font-size: 16px; line-height: 1.6; margin-bottom: 20px; }
+    .widget {
+      display: flex;
+      justify-content: center;
+      min-height: 66px;
+      margin-bottom: 24px;
+    }
+    .reason {
+      background: #f7fafc;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 12px;
+      margin-bottom: 24px;
+      font-family: monospace;
+      font-size: 12px;
+      color: #718096;
+      word-break: break-all;
+      text-align: left;
+    }
+    .contact { background: #f7fafc; border-radius: 12px; padding: 20px; font-size: 14px; }
+    .contact a { color: #667eea; text-decoration: none; font-weight: 600; }
+    .contact a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">&#128075;</div>
+    <h1>Quick check &mdash; are you human?</h1>
+    <p>Your browser matched a pattern our bot protection watches for.
+       Complete the check below and you'll continue straight to the page.</p>
+    <div class="widget">
+      <div class="cf-turnstile" data-sitekey="${TURNSTILE_SITE_KEY}" data-callback="__bbSolved"></div>
+    </div>
+    <div class="reason"><strong>Matched rule:</strong> {{REASON}}</div>
+    <div class="contact">
+      <p style="margin-bottom: 0;">No luck, or no JavaScript? Email <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a> and we'll sort it out.</p>
+    </div>
+  </div>
+  <script>
+    function __bbSolved(token) {
+      try {
+        var url = new URL(window.location.href);
+        url.searchParams.set('${CHALLENGE_TOKEN_PARAM}', token);
+        window.location.replace(url.toString());
+      } catch (e) {
+        var sep = window.location.search ? '&' : '?';
+        window.location.href = window.location.href + sep + '${CHALLENGE_TOKEN_PARAM}=' + encodeURIComponent(token);
+      }
+    }
+  </script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+</body>
+</html>`;
+
 // =============================================================================
 // HTTP SERVER
 // =============================================================================
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const userAgent = req.headers['x-forwarded-user-agent'] || req.headers['user-agent'] || '';
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
   const requestPath = req.headers['x-forwarded-uri'] || req.url || '/';
@@ -972,19 +1259,56 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Challenge solve callback (?__bb_token=...). MUST run before the blocking
+  // rules — the request carrying the token comes from a still-blocked client.
+  if (CHALLENGE_ENABLED) {
+    const tokenReq = extractChallengeToken(requestPath);
+    if (tokenReq) {
+      if (isVerifyRateLimited(ip)) {
+        logChallenge('challenge_verify_limited', ip, userAgent, 'Too many verify attempts', requestPath);
+        res.writeHead(429, { 'Retry-After': '60' });
+        res.end();
+        return;
+      }
+      const solved = await verifyTurnstileToken(tokenReq.token, ip);
+      if (solved) {
+        // A permabanned human just proved themselves — lift the ban. The
+        // behavioral trackers keep running, so a scraper that solves once and
+        // keeps hammering earns a fresh ban (and another solve, per exit IP).
+        if (bannedIPs.has(ip)) {
+          bannedIPs.delete(ip);
+          saveBannedIPs();
+          console.log(`[CHALLENGE] Lifted permaban for ${ip} after solved challenge`);
+        }
+        logChallenge('challenge_passed', ip, userAgent, 'Challenge solved', tokenReq.cleanUri);
+        res.writeHead(302, {
+          'Set-Cookie': makePassCookie(ip),
+          'Location': tokenReq.cleanUri,
+          'Cache-Control': 'no-store',
+        });
+        res.end();
+        return;
+      }
+      logChallenge('challenge_failed', ip, userAgent, 'Token rejected by siteverify', tokenReq.cleanUri);
+      // Redirect to the clean URL: the still-blocked client meets the
+      // challenge page again there and can retry.
+      res.writeHead(302, { 'Location': tokenReq.cleanUri, 'Cache-Control': 'no-store' });
+      res.end();
+      return;
+    }
+  }
+
+  // A valid pass cookie bypasses ONLY the challenge-eligible heuristics below
+  // (UA signatures, the 43/8 combo). Hard rules, rate limits and scrape
+  // detection still apply to cookie holders. Permabans need no bypass —
+  // solving the challenge lifted them.
+  const hasPass = CHALLENGE_ENABLED && hasValidPassCookie(req.headers['cookie'], ip);
+
   // Check permanent ban
   if (isPermanentlyBanned(ip)) {
     const info = bannedIPs.get(ip);
     logBlocked('permaban', ip, userAgent, info.reason, requestPath);
-
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g,
-      `Permanently banned: ${info.reason}`);
-
-    res.writeHead(403, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'X-Blocked-Reason': 'permaban',
-    });
-    res.end(html);
+    serveChallengeOrBlock(res, `Permanently banned: ${info.reason}`, 'permaban');
     return;
   }
 
@@ -1005,9 +1329,19 @@ const server = http.createServer((req, res) => {
   }
 
   // Check blocked bots
-  for (const { pattern, reason } of BLOCKED_BOTS) {
+  for (const { pattern, reason, challenge } of BLOCKED_BOTS) {
     if (pattern.test(userAgent)) {
+      // Solved challenge exempts the UA-signature rules — a verified human
+      // with a UA-freezing privacy tool browses normally from here on.
+      if (challenge && hasPass) {
+        continue;
+      }
       logBlocked('bot', ip, userAgent, reason, requestPath);
+
+      if (challenge) {
+        serveChallengeOrBlock(res, reason, reason);
+        return;
+      }
 
       const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
 
@@ -1046,16 +1380,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Check Chinese botnet (combination detection)
-  if (isChineseBotnet(ip, userAgent)) {
+  // Check Chinese botnet (combination detection).
+  // Challenge-eligible: the rule spans the ENTIRE 43.0.0.0/8 — which contains
+  // real Asian residential ISPs — combined with the most common OS+browser on
+  // earth. The riskiest heuristic we run (5.1k distinct IPs / 8 days); any
+  // real human inside gets a way through, the botnet doesn't solve widgets.
+  if (!hasPass && isChineseBotnet(ip, userAgent)) {
     const reason = 'Chinese cloud botnet (43.x + HTTP/1.1 + outdated Chrome)';
     logBlocked('botnet', ip, userAgent, reason, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
-    res.writeHead(403, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'X-Blocked-Reason': 'chinese_botnet',
-    });
-    res.end(html);
+    serveChallengeOrBlock(res, reason, 'chinese_botnet');
     return;
   }
 
@@ -1101,18 +1434,15 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Check locale switching (may trigger permanent ban)
+  // Check locale switching (may trigger permanent ban).
+  // The ban page is challenge-eligible — permabans have the highest cost when
+  // wrong (30 days), and solving the challenge lifts the ban. The detection
+  // itself still runs for cookie holders: prove-human ≠ scrape-freely, and a
+  // re-triggered ban costs another solve.
   if (checkLocaleSwitch(ip, requestPath)) {
     const info = bannedIPs.get(ip);
     logBlocked('locale_switch', ip, userAgent, info.reason, requestPath);
-
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, info.reason);
-
-    res.writeHead(403, {
-      'Content-Type': 'text/html; charset=utf-8',
-      'X-Blocked-Reason': 'locale_switch',
-    });
-    res.end(html);
+    serveChallengeOrBlock(res, info.reason, 'locale_switch');
     return;
   }
 
@@ -1121,15 +1451,7 @@ const server = http.createServer((req, res) => {
   if (scrapeResult) {
     if (scrapeResult.banned) {
       logBlocked('page_scrape_ban', ip, userAgent, scrapeResult.reason, requestPath);
-
-      const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g,
-        `Permanently banned: ${scrapeResult.reason}`);
-
-      res.writeHead(403, {
-        'Content-Type': 'text/html; charset=utf-8',
-        'X-Blocked-Reason': 'page_scrape_ban',
-      });
-      res.end(html);
+      serveChallengeOrBlock(res, `Permanently banned: ${scrapeResult.reason}`, 'page_scrape_ban');
       return;
     } else {
       logBlocked('page_scrape', ip, userAgent,
@@ -1167,12 +1489,17 @@ const server = http.createServer((req, res) => {
 // STARTUP
 // =============================================================================
 
+// Guarded so tests can `require('./server.js')` and exercise the helpers
+// without starting the server or touching the log directory.
+if (require.main === module) {
+
 ensureLogDir();
 loadBannedIPs();
 
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
+  console.log(`Challenge: ${CHALLENGE_ENABLED ? `ENABLED (cookie TTL ${CHALLENGE_COOKIE_TTL_MS / 86400000}d)` : 'disabled (missing TURNSTILE_SITE_KEY/TURNSTILE_SECRET_KEY/CHALLENGE_COOKIE_SECRET or CHALLENGE_ENABLED=false)'}`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
   console.log(`Cloud botnet CIDR ranges: ${CLOUD_PROVIDER_CIDRS.length} (requires X-Original-Protocol header)`);
@@ -1185,3 +1512,19 @@ server.listen(PORT, () => {
   console.log(`Contact email: ${CONTACT_EMAIL}`);
   scheduleNextSummary();
 });
+
+} // require.main guard
+
+// Exported for unit tests only — the module never gets required in production.
+module.exports = {
+  signPassCookie,
+  makePassCookie,
+  hasValidPassCookie,
+  extractChallengeToken,
+  verifyTurnstileToken,
+  isVerifyRateLimited,
+  BLOCKED_BOTS,
+  CHALLENGE_ENABLED,
+  CHALLENGE_COOKIE_NAME,
+  CHALLENGE_TOKEN_PARAM,
+};
