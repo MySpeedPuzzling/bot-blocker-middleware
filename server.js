@@ -1253,7 +1253,23 @@ const CHALLENGE_HTML = `<!DOCTYPE html>
 // HTTP SERVER
 // =============================================================================
 
-const server = http.createServer(async (req, res) => {
+// FAIL OPEN on internal errors. The handler is async (challenge verification
+// awaits siteverify); an uncaught throw would be an unhandled rejection and
+// CRASH the process — and a dead forwardAuth service makes Traefik answer 500
+// on every page of the site until Docker restarts us. A bug in the blocker
+// must degrade to "not blocking", never to "blocking everyone" — same
+// philosophy as the CrowdSec bouncer's fail-open on LAPI loss.
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch((err) => {
+    console.error(`[ERROR] handler failed open: ${err.stack || err.message}`);
+    if (!res.headersSent) {
+      res.writeHead(200);
+    }
+    res.end('OK');
+  });
+});
+
+async function handleRequest(req, res) {
   const userAgent = req.headers['x-forwarded-user-agent'] || req.headers['user-agent'] || '';
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
   const requestPath = req.headers['x-forwarded-uri'] || req.url || '/';
@@ -1501,7 +1517,7 @@ const server = http.createServer(async (req, res) => {
   // Allow request
   res.writeHead(200);
   res.end('OK');
-});
+}
 
 // =============================================================================
 // STARTUP
@@ -1535,6 +1551,7 @@ server.listen(PORT, () => {
 
 // Exported for unit tests only — the module never gets required in production.
 module.exports = {
+  server,
   signPassCookie,
   buildRedirectUrl,
   makePassCookie,

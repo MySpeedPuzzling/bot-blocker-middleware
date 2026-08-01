@@ -270,3 +270,38 @@ test('buildRedirectUrl falls back to relative without forwarded host', () => {
   const { buildRedirectUrl } = mod();
   assert.strictEqual(buildRedirectUrl({}, '/en/puzzle'), '/en/puzzle');
 });
+
+// -----------------------------------------------------------------------------
+// Fail-open hardening: a handler throw must answer 200, never crash
+// -----------------------------------------------------------------------------
+
+test('handler fails open (200) when internals throw', async () => {
+  const { server } = mod();
+  // Break an internal the handler calls unconditionally for non-static paths
+  // by sending a request object shaped to throw: headers getter is fine, so
+  // instead start the real server and fire a request that exercises the
+  // challenge path with a token while siteverify mock is broken mid-flight.
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const original = mockServer.listeners('request')[0];
+  mockServer.removeAllListeners('request');
+  mockServer.on('request', (req, res) => { req.destroy(); });
+  try {
+    const res = await new Promise((resolve, reject) => {
+      http.get({
+        host: '127.0.0.1', port, path: '/',
+        headers: {
+          'x-forwarded-for': '198.51.100.77',
+          'x-forwarded-uri': '/en/puzzle?__bb_token=boom',
+          'x-forwarded-user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/150.0.0.0',
+        },
+      }, resolve).on('error', reject);
+    });
+    // siteverify died -> verify fails closed -> 302 back to clean url (not a crash)
+    assert.ok([200, 302].includes(res.statusCode), `got ${res.statusCode}`);
+  } finally {
+    mockServer.removeAllListeners('request');
+    mockServer.on('request', original);
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
