@@ -71,6 +71,17 @@ labels:
 | `CHALLENGE_COOKIE_TTL_DAYS` | `7` | How long a solved challenge holds |
 | `CHALLENGE_VERIFY_LIMIT` | `5` | siteverify attempts per IP per minute |
 | `CHALLENGE_ENABLED` | `true` | Kill switch (`false` disables even with keys set) |
+| `TRUST_COOKIE_SECRET` | *(=CHALLENGE_COOKIE_SECRET)* | HMAC secret validating the app-issued `__bb_trust` cookie |
+| `TRUST_COOKIE_TTL_DAYS` | `365` | Max age of a trust cookie (from its embedded issued-at) |
+| `SCORING_MODE` | `log` | Risk ladder: `off` / `log` (shadow) / `challenge` |
+| `SCORE_THRESHOLD` | `60` | Score at/above which the ladder challenges |
+| `SCORE_LOG_MIN` | `25` | Scores ≥ this are logged even below the threshold |
+| `HIGH_RISK_COUNTRIES` | `CN,HK,SG,VN,ID` | Audience-prior country list (comma-separated ISO codes) |
+| `SURGE_BASELINE_5M` | `300` | Calm-traffic scorable requests per 5 min (pressure = rate/baseline) |
+| `SURGE_EXTRA_SCORE` | `20` | Extra base score for locale+cookieless requests while pressure > 2× |
+| `WHITELIST_BOT_CAP` | `30` | Per-IP req/min cap for UA-only whitelisted crawlers |
+| `RDNS_TIMEOUT_MS` | `1500` | Timeout per rDNS lookup step (fail-open on expiry) |
+| `GEODB_DIR` | `./geodb` | Directory with the DB-IP binary range files |
 
 ## Human-Recovery Challenge (Cloudflare Turnstile)
 
@@ -109,6 +120,52 @@ only, and returns our full response to the client on non-2xx):
 
 `challenge_passed` entries in the daily JSONL log are the **measured
 false-positive rate** of the challenge-eligible rules.
+
+## Trusted-Human Cookie (`__bb_trust`)
+
+The MySpeedPuzzling app mints an HMAC-signed cookie on authenticated
+responses (`BotTrustCookieSubscriber` + `BotTrustCookieSigner` in the app
+repo); this middleware only validates it. A valid cookie is a **full bypass**
+— including permabans and rate limits (competition venues put 1000+ real
+users behind one WiFi IP). It is deliberately **not** IP-bound: phones roam.
+Format: `base64url("bb-trust|v1|<uid>|<iatMs>") + "." + base64url(hmac)`,
+signed with `CHALLENGE_COOKIE_SECRET` (domain-separated from `__bb_pass`).
+Both repos pin the wire format with the same golden-vector test.
+
+## Risk-Scoring Ladder
+
+For anonymous HTML GETs that pass every deterministic rule, a per-request
+score is computed from weak signals — datacenter ASN (GeoDB), audience-prior
+country, impossible-Chromium header sets (missing `Sec-Fetch-*`/`sec-ch-ua`,
+platform contradicting the UA), missing/mismatched `Accept-Language`, and
+cookie-persistence anomalies — multiplied by global crawl **pressure**
+(current rate vs `SURGE_BASELINE_5M`, capped 2.5×), so the ladder tightens
+itself during a distributed crawl and relaxes after. At/above
+`SCORE_THRESHOLD` the request gets the **Turnstile challenge** (never a hard
+block); solving sets the standard pass cookie. `SCORING_MODE=log` (default)
+only writes `risk_shadow`/`risk_observe` JSONL entries with full component
+breakdowns — deploy in shadow, tune the threshold from real data, then flip
+to `challenge`.
+
+Built against the 2026-07/08 residential-proxy swarm: 15k IPs/3.4 days, 89%
+seen a single day (per-IP counters useless), flawless Chrome UAs over h2/h3,
+executing Google Analytics from worldwide consumer ISPs.
+
+## Verified Crawler Whitelist
+
+`Googlebot`/`Bingbot`/`SeznamBot`/`YandexBot`/`Applebot` UAs are verified
+with forward-confirmed rDNS (cached 48 h; DNS trouble fails **open**,
+definitive mismatch falls through to the normal pipeline as a fake). UA-only
+entries (link-preview bots, `meta-webindexer`) pass under a
+`WHITELIST_BOT_CAP`/min per-IP budget. Stripe stays uncapped — webhook
+delivery must never break.
+
+## GeoDB (DB-IP)
+
+`scripts/build-geodb.mjs` compiles the free DB-IP lite databases into binary
+range files at image build; a monthly scheduled CI rebuild keeps them fresh.
+Missing files degrade gracefully (geo/ASN signals score 0).
+*IP geolocation by [DB-IP](https://db-ip.com) (CC BY 4.0).*
 
 ## Adding New Bot Patterns
 

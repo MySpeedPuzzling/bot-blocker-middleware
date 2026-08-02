@@ -10,9 +10,13 @@ Bot Blocker Middleware is a Traefik ForwardAuth middleware for blocking bots and
 
 ```bash
 npm start          # Start the server (runs node server.js)
+npm test           # Unit tests (node --test test/*.test.js) — gate the image build in CI
+node scripts/build-geodb.mjs <dir>   # Compile DB-IP lite into the geodb binary files
 ```
 
-No build step, linting, or tests are configured.
+No build step or linting is configured. Tests run per-file in separate
+processes; env consts are read at module load, so each test file sets
+`process.env` BEFORE requiring `../server.js`.
 
 ## Architecture
 
@@ -20,7 +24,8 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 
 **Request flow:**
 1. Static asset check → bypass rate limiting for `/build/`, `/css/`, `/img/`, etc.
-2. Search engine bot whitelist → immediate 200 for Googlebot, Bingbot, YandexBot, DuckDuckBot, social media crawlers, etc.
+2. Crawler whitelist, TIERED (2026-08): rDNS-verified (Google/Bing/Seznam/Yandex/Apple — forward-confirmed PTR, cached, fail-OPEN on DNS trouble) → 200 unlimited; UA-only entries (preview bots, meta-webindexer) → 200 under a per-IP cap, 429 above; rDNS-refuted impersonators → logged `fake_crawler` and FALL THROUGH to the full pipeline.
+2b. Challenge-solve callback (`?__bb_token=`), then **trusted-human cookie** (`__bb_trust`, minted by the app for logged-in users) → immediate 200, bypasses EVERYTHING below including permabans and rate limits (competition WiFi: 1000+ users, one IP). Not IP-bound; a golden-vector test pins the wire format against the app repo.
 3. Permanent ban check → immediate 403 for banned IPs
 4. Blocked path check → immediate 403 for WordPress exploits, `.env`, `.git` access
 5. Bot detection → 403 for known bad user agents (SEO bots, AI crawlers, impossible browser combos)
@@ -34,7 +39,8 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 13. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
 14. Page scraping check → 429/403 for rapid puzzle/profile page scraping (IP+UA keyed)
 15. Rate limiting → 429 if IP+UA exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
-16. Allow → 200 OK
+16. **Risk-scoring ladder** (2026-08, D50 in lily.srv) → for anonymous HTML GETs only: weak signals (datacenter ASN via baked-in DB-IP GeoDB, audience-prior country, impossible-Chromium header sets, Accept-Language/locale mismatch, cookie-persistence anomalies) × global crawl-pressure multiplier; score ≥ `SCORE_THRESHOLD` serves the Turnstile challenge — NEVER a hard block, honoring the lesson of the two removed aggregate rules above. `SCORING_MODE=log` (default) is shadow-only; flip to `challenge` only after shadow logs confirm the threshold on real traffic.
+17. Allow → 200 OK
 
 **Key data structures in `server.js`:**
 - `STATIC_ASSET_PATTERNS` - regex array for paths excluded from all checks. Includes generic top-level static-extension match (`/foo.svg`, `/foo.png`, `/foo.css` etc.).

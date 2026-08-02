@@ -12,6 +12,11 @@ on:
     pull_request:
         branches:
             - main
+    # Monthly rebuild so the baked-in DB-IP GeoDB (scripts/build-geodb.mjs)
+    # stays fresh — day 5 avoids DB-IP's month-rollover publishing lag.
+    schedule:
+        - cron: '25 4 5 * *'
+    workflow_dispatch:
 
 env:
     REGISTRY_IMAGE: ghcr.io/myspeedpuzzling/bot-blocker-middleware

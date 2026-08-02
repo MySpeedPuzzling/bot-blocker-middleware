@@ -2,6 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns');
 
 // =============================================================================
 // CONFIGURATION
@@ -33,6 +34,46 @@ const CHALLENGE_COOKIE_TTL_MS = (parseInt(process.env.CHALLENGE_COOKIE_TTL_DAYS,
 const CHALLENGE_VERIFY_LIMIT = parseInt(process.env.CHALLENGE_VERIFY_LIMIT, 10) || 5; // siteverify attempts per IP per minute
 const CHALLENGE_ENABLED = process.env.CHALLENGE_ENABLED !== 'false'
   && TURNSTILE_SITE_KEY !== '' && TURNSTILE_SECRET_KEY !== '' && CHALLENGE_COOKIE_SECRET !== '';
+
+// Trusted-human cookie (__bb_trust), ISSUED BY THE APP on authenticated
+// responses (BotTrustCookieSubscriber in the MySpeedPuzzling repo) and only
+// VALIDATED here. A logged-in account is the strongest human signal we have:
+// a valid cookie bypasses every heuristic in this middleware. Deliberately
+// NOT IP-bound (unlike __bb_pass) — phones roam networks daily and puzzle
+// competitions put 1000+ users behind one WiFi IP; the cookie must survive
+// both. The HMAC input is domain-separated ("bb-trust|v1|...") from the pass
+// cookie's ("<ip>|<expires>"), so both cookie types safely share
+// CHALLENGE_COOKIE_SECRET — which the app already receives via its .env.
+// Wire format (must match the app's signer byte-for-byte):
+//   base64url("bb-trust|v1|<uid>|<iatMs>") + "." + base64url(HMAC-SHA256 raw)
+const TRUST_COOKIE_NAME = '__bb_trust';
+const TRUST_COOKIE_SECRET = process.env.TRUST_COOKIE_SECRET || CHALLENGE_COOKIE_SECRET;
+const TRUST_COOKIE_TTL_MS = (parseInt(process.env.TRUST_COOKIE_TTL_DAYS, 10) || 365) * 24 * 60 * 60 * 1000;
+const TRUST_ENABLED = TRUST_COOKIE_SECRET !== '';
+
+// Risk-scoring ladder (see RISK SCORING section). 'off' | 'log' | 'challenge':
+// 'log' (shadow mode, the default) computes and logs scores but never acts —
+// deploying this is a no-op for traffic; flip to 'challenge' only after the
+// shadow logs confirm the threshold is clean on real users.
+const SCORING_MODE = (process.env.SCORING_MODE || 'log').toLowerCase();
+const SCORE_THRESHOLD = parseInt(process.env.SCORE_THRESHOLD, 10) || 60;
+// Scores >= this are logged (type risk_observe) even below the threshold, so
+// the shadow phase sees the full distribution without logging every request.
+const SCORE_LOG_MIN = parseInt(process.env.SCORE_LOG_MIN, 10) || 25;
+// Countries with ~no genuine audience but dominant botnet exits (GA data).
+const HIGH_RISK_COUNTRIES = new Set((process.env.HIGH_RISK_COUNTRIES || 'CN,HK,SG,VN,ID')
+  .split(',').map(s => s.trim().toUpperCase()).filter(Boolean));
+// Calm-traffic rate of scorable (anonymous HTML GET) requests per 5 minutes.
+// Pressure = current rate / baseline; it multiplies scores (capped) so the
+// ladder auto-tightens under a distributed crawl and relaxes when it stops.
+const SURGE_BASELINE_5M = parseInt(process.env.SURGE_BASELINE_5M, 10) || 300;
+// Extra base score for locale-prefixed cookieless requests while pressure > 2×
+// — the exact surface the 2026-07 residential swarm crawled.
+const SURGE_EXTRA_SCORE = parseInt(process.env.SURGE_EXTRA_SCORE, 10) || 20;
+// Per-IP requests/min cap for whitelisted-by-UA-only crawlers (link-preview
+// bots, meta-webindexer): UA strings are trivially spoofable, so the uncapped
+// whitelist is reserved for rDNS-verified crawlers.
+const WHITELIST_BOT_CAP = parseInt(process.env.WHITELIST_BOT_CAP, 10) || 30;
 
 // Locale scraping detection
 const LOCALE_THRESHOLD = parseInt(process.env.LOCALE_THRESHOLD, 10) || 4;       // unique locales
@@ -91,52 +132,171 @@ function isStaticAsset(requestPath) {
 // SEARCH ENGINE BOT WHITELIST (bypass all blocking)
 // =============================================================================
 
+// Three trust tiers (a bare UA regex is spoofable — 425+ "Googlebot" UAs over
+// HTTP/1.1 were observed passing here 2026-07-30..08-02 with zero verification):
+//   rdns: [...]  — verify with forward-confirmed reverse DNS (the procedure
+//                  Google/Bing/Seznam document). Verified → unlimited pass.
+//                  Definitive mismatch (PTR elsewhere / NXDOMAIN) → treated as
+//                  a FAKE crawler: falls through to the normal pipeline (where
+//                  datacenter-ASN scoring usually catches it). DNS
+//                  timeout/SERVFAIL → fail OPEN (whitelist honored, uncached):
+//                  never 403 real Googlebot because a resolver hiccuped.
+//   capped: true — UA-only whitelist with a WHITELIST_BOT_CAP/min per-IP
+//                  budget (429 above it). For preview bots that fetch a page
+//                  per human share, the cap is unreachable; for a scraper
+//                  hiding behind "WhatsApp" it's a ceiling. meta-webindexer
+//                  sits here on purpose: verified via .fbsv.net but capped —
+//                  8k+ pages in 3 days is not link-preview behavior.
+//   (neither)    — legacy unlimited UA-only pass. Reserved for Stripe
+//                  webhooks: capping those risks dropped payment events, a
+//                  far worse failure than tolerating a spoofable UA that was
+//                  spoofable yesterday too.
+const RDNS_GOOGLE = ['.googlebot.com', '.google.com'];
+const RDNS_BING = ['.search.msn.com'];
+const RDNS_META = ['.fbsv.net'];
+
 const WHITELISTED_BOTS = [
   // Google (https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers)
-  { pattern: /Googlebot/i, name: 'Googlebot' },
-  { pattern: /Google-InspectionTool/i, name: 'Google Search Console' },
-  { pattern: /Storebot-Google/i, name: 'Google Merchant' },
-  { pattern: /AdsBot-Google/i, name: 'Google Ads' },
-  { pattern: /Mediapartners-Google/i, name: 'Google AdSense' },
-  { pattern: /APIs-Google/i, name: 'Google APIs' },
-  { pattern: /GoogleOther/i, name: 'Google Other' },
+  { pattern: /Googlebot/i, name: 'Googlebot', rdns: RDNS_GOOGLE },
+  { pattern: /Google-InspectionTool/i, name: 'Google Search Console', rdns: RDNS_GOOGLE },
+  { pattern: /Storebot-Google/i, name: 'Google Merchant', rdns: RDNS_GOOGLE },
+  { pattern: /AdsBot-Google/i, name: 'Google Ads', rdns: RDNS_GOOGLE },
+  { pattern: /Mediapartners-Google/i, name: 'Google AdSense', rdns: RDNS_GOOGLE },
+  { pattern: /APIs-Google/i, name: 'Google APIs', rdns: RDNS_GOOGLE },
+  { pattern: /GoogleOther/i, name: 'Google Other', rdns: RDNS_GOOGLE },
 
   // Bing / Microsoft
-  { pattern: /bingbot/i, name: 'Bingbot' },
-  { pattern: /msnbot/i, name: 'MSN Bot' },
-  { pattern: /AdIdxBot/i, name: 'Microsoft Advertising' },
-  { pattern: /BingPreview/i, name: 'Bing Preview' },
+  { pattern: /bingbot/i, name: 'Bingbot', rdns: RDNS_BING },
+  { pattern: /msnbot/i, name: 'MSN Bot', rdns: RDNS_BING },
+  { pattern: /AdIdxBot/i, name: 'Microsoft Advertising', rdns: RDNS_BING },
+  { pattern: /BingPreview/i, name: 'Bing Preview', rdns: RDNS_BING },
 
   // Other search engines
-  { pattern: /YandexBot/i, name: 'Yandex' },
-  { pattern: /DuckDuckBot/i, name: 'DuckDuckGo' },
-  { pattern: /Slurp/i, name: 'Yahoo' },
-  { pattern: /Applebot/i, name: 'Apple (Siri/Spotlight)' },
-  { pattern: /Qwant/i, name: 'Qwant' },
-  { pattern: /SeznamBot/i, name: 'Seznam' },
+  { pattern: /YandexBot/i, name: 'Yandex', rdns: ['.yandex.ru', '.yandex.net', '.yandex.com'] },
+  { pattern: /DuckDuckBot/i, name: 'DuckDuckGo', capped: true },  // publishes IPs, not rDNS
+  { pattern: /Slurp/i, name: 'Yahoo', capped: true },
+  { pattern: /Applebot/i, name: 'Apple (Siri/Spotlight)', rdns: ['.applebot.apple.com'] },
+  { pattern: /Qwant/i, name: 'Qwant', capped: true },
+  { pattern: /SeznamBot/i, name: 'Seznam', rdns: ['.seznam.cz'] },
 
-  // Social media previews (important for link sharing/SEO)
-  { pattern: /facebookexternalhit/i, name: 'Facebook' },
-  { pattern: /meta-externalagent/i, name: 'Meta (external agent)' },
-  { pattern: /meta-webindexer/i, name: 'Meta (web indexer)' },
-  { pattern: /Twitterbot/i, name: 'Twitter/X' },
-  { pattern: /LinkedInBot/i, name: 'LinkedIn' },
-  { pattern: /WhatsApp/i, name: 'WhatsApp' },
-  { pattern: /Slackbot/i, name: 'Slack' },
-  { pattern: /TelegramBot/i, name: 'Telegram' },
-  { pattern: /Discordbot/i, name: 'Discord' },
+  // Social media previews (important for link sharing/SEO) — fetch one page
+  // per human share; the per-IP cap never touches that, only impersonators.
+  { pattern: /facebookexternalhit/i, name: 'Facebook', rdns: RDNS_META, capped: true },
+  { pattern: /meta-externalagent/i, name: 'Meta (external agent)', rdns: RDNS_META, capped: true },
+  { pattern: /meta-webindexer/i, name: 'Meta (web indexer)', rdns: RDNS_META, capped: true },
+  { pattern: /Twitterbot/i, name: 'Twitter/X', capped: true },
+  { pattern: /LinkedInBot/i, name: 'LinkedIn', capped: true },
+  { pattern: /WhatsApp/i, name: 'WhatsApp', capped: true },
+  { pattern: /Slackbot/i, name: 'Slack', capped: true },
+  { pattern: /TelegramBot/i, name: 'Telegram', capped: true },
+  { pattern: /Discordbot/i, name: 'Discord', capped: true },
 
   // Monitoring
-  { pattern: /SentryUptimeBot/i, name: 'Sentry Uptime' },
-  { pattern: /Stripe\//i, name: 'Stripe' },
+  { pattern: /SentryUptimeBot/i, name: 'Sentry Uptime', capped: true },
+  { pattern: /Stripe\//i, name: 'Stripe' },  // uncapped: never risk webhook delivery
 ];
 
-function isWhitelistedBot(userAgent) {
-  if (!userAgent) return false;
-  for (const { pattern, name } of WHITELISTED_BOTS) {
-    if (pattern.test(userAgent)) return name;
+// ---------------------------------------------------------------------------
+// Forward-confirmed rDNS: PTR of the IP must end with an allowed suffix AND
+// the PTR hostname must resolve back to the same IP. Results cached per IP
+// (positive 48h, negative 24h). dnsReverse/dnsResolve are indirected so tests
+// inject a fake resolver.
+// ---------------------------------------------------------------------------
+
+const RDNS_TIMEOUT_MS = parseInt(process.env.RDNS_TIMEOUT_MS, 10) || 1500;
+const RDNS_OK_TTL_MS = 48 * 60 * 60 * 1000;
+const RDNS_FAKE_TTL_MS = 24 * 60 * 60 * 1000;
+
+let dnsReverse = (ip) => dns.promises.reverse(ip);
+let dnsResolve = (hostname) => dns.promises.resolve4(hostname);
+
+function _setDnsForTests(reverseFn, resolveFn) {
+  dnsReverse = reverseFn;
+  dnsResolve = resolveFn;
+  rdnsCache.clear();
+}
+
+const rdnsCache = new Map();  // ip -> { state: 'ok'|'fake', exp }
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error('rdns timeout')), ms);
+    timer.unref?.();
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+async function verifyCrawlerRdns(ip, suffixes) {
+  const cached = rdnsCache.get(ip);
+  if (cached && cached.exp > Date.now()) return cached.state;
+
+  let state;
+  try {
+    const ptrs = await withTimeout(dnsReverse(ip), RDNS_TIMEOUT_MS);
+    const host = (ptrs || []).find(h => {
+      const lower = h.toLowerCase();
+      return suffixes.some(s => lower.endsWith(s));
+    });
+    if (!host) {
+      state = 'fake';
+    } else {
+      const addrs = await withTimeout(dnsResolve(host), RDNS_TIMEOUT_MS);
+      state = (addrs || []).includes(ip) ? 'ok' : 'fake';
+    }
+  } catch (err) {
+    // NXDOMAIN/no-PTR is a definitive answer — a real crawler always has one.
+    // Anything else (timeout, SERVFAIL) is OUR uncertainty: fail open, no cache.
+    if (err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA')) {
+      state = 'fake';
+    } else {
+      return 'error';
+    }
   }
-  return false;
+
+  rdnsCache.set(ip, { state, exp: Date.now() + (state === 'ok' ? RDNS_OK_TTL_MS : RDNS_FAKE_TTL_MS) });
+  return state;
+}
+
+const crawlerBuckets = new Map();  // "name|ip" -> { count, windowStart }
+
+function isCrawlerCapped(name, ip) {
+  const key = name + '|' + ip;
+  const now = Date.now();
+  const record = crawlerBuckets.get(key);
+  if (!record || now - record.windowStart > 60000) {
+    crawlerBuckets.set(key, { count: 1, windowStart: now });
+    return false;
+  }
+  record.count++;
+  return record.count > WHITELIST_BOT_CAP;
+}
+
+/**
+ * Whitelist resolution for a matched crawler UA.
+ * Returns null (no whitelist claim) or:
+ *   { name, allow: true }  — pass unlimited
+ *   { name, capped: true } — over the per-IP budget, serve 429
+ *   { name, fake: true }   — rDNS-refuted impersonator: fall through to the
+ *                            normal pipeline (NOT an instant block — a real
+ *                            human behind a weird UA string deserves the same
+ *                            scoring/challenges as everyone else)
+ */
+async function checkWhitelistedBot(userAgent, ip) {
+  if (!userAgent) return null;
+  for (const entry of WHITELISTED_BOTS) {
+    if (!entry.pattern.test(userAgent)) continue;
+    if (entry.rdns) {
+      const state = await verifyCrawlerRdns(ip, entry.rdns);
+      if (state === 'fake') return { name: entry.name, fake: true };
+      // 'ok' → verified; 'error' → fail open (uncached, retried next request)
+    }
+    if (entry.capped && isCrawlerCapped(entry.name, ip)) {
+      return { name: entry.name, capped: true };
+    }
+    return { name: entry.name, allow: true };
+  }
+  return null;
 }
 
 // =============================================================================
@@ -240,15 +400,13 @@ const BLOCKED_BOTS = [
 
 const BLOCKED_CIDRS = [
   { prefix: '43.104.33.', reason: 'Known Chinese botnet subnet' },
-  // 43.173.168.0/21 covers 43.173.168-175.x
-  { prefix: '43.173.168.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.169.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.170.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.171.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.172.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.173.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.174.', reason: 'Known Chinese botnet subnet' },
-  { prefix: '43.173.175.', reason: 'Known Chinese botnet subnet' },
+  // 43.172.0.0/15 (43.172.x + 43.173.x) is Tencent Cloud end to end — 2 305
+  // distinct IPs from it crawled /en/ with rotating Win10/Chrome UAs
+  // 2026-07-29..08-02 (99.97% already 403'd by the combo rule; this closes
+  // the non-Win10-UA remainder). Supersedes the old per-/24 43.173.168-175
+  // entries.
+  { prefix: '43.172.', reason: 'Tencent Cloud botnet range (43.172.0.0/15)' },
+  { prefix: '43.173.', reason: 'Tencent Cloud botnet range (43.172.0.0/15)' },
   // Baidu ASN 38365 — commercial crawler infrastructure, no real users
   { prefix: '220.181.', reason: 'Baidu crawler ASN (commercial infra, no real users)' },
   // Indonesian residential-proxy botnet subnet — 121+ distinct IPs observed in
@@ -434,6 +592,246 @@ function isHTTP1Browser(userAgent, originalProtocol) {
 }
 
 // =============================================================================
+// GEOIP (DB-IP lite: country + ASN, IPv4)
+//
+// The binary range files are produced at IMAGE BUILD time by
+// scripts/build-geodb.mjs from the free DB-IP "IP to Country Lite" and "IP to
+// ASN Lite" databases (CC BY 4.0 — attribution kept in README; refreshed by
+// the monthly scheduled CI rebuild). Zero runtime dependencies: fixed-size
+// records binary-searched directly in the loaded Buffer.
+//
+// Missing/corrupt files DEGRADE GRACEFULLY: lookups return null, the geo/ASN
+// risk signals contribute 0, everything else keeps working. Never fail closed
+// on a data file.
+//
+// Formats (must match scripts/build-geodb.mjs):
+//   country.bin  9-byte records [u32BE start][u32BE end][u8 countryIdx]
+//   asn.bin     10-byte records [u32BE start][u32BE end][u16BE orgIdx]
+//                orgIdx 0xFFFF = not a datacenter org (kept for range lookup)
+//   meta.json   { countries: ["CZ", ...], dcOrgs: ["Amazon...", ...] }
+// =============================================================================
+
+const GEODB_DIR = process.env.GEODB_DIR || path.join(__dirname, 'geodb');
+
+const geoDb = { countryBuf: null, asnBuf: null, countries: [], dcOrgs: [] };
+
+function initGeoDb(dir) {
+  geoDb.countryBuf = null;
+  geoDb.asnBuf = null;
+  geoDb.countries = [];
+  geoDb.dcOrgs = [];
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
+    geoDb.countries = meta.countries || [];
+    geoDb.dcOrgs = meta.dcOrgs || [];
+    geoDb.countryBuf = fs.readFileSync(path.join(dir, 'country.bin'));
+    geoDb.asnBuf = fs.readFileSync(path.join(dir, 'asn.bin'));
+    console.log(`[GEODB] Loaded ${geoDb.countryBuf.length / 9} country ranges, `
+      + `${geoDb.asnBuf.length / 10} ASN ranges (built ${meta.built || 'unknown'})`);
+    return true;
+  } catch (err) {
+    geoDb.countryBuf = null;
+    geoDb.asnBuf = null;
+    console.log(`[GEODB] Not available (${err.message}) — geo/ASN risk signals disabled`);
+    return false;
+  }
+}
+
+// Binary search over sorted fixed-size records; returns record offset or -1.
+function geoRangeLookup(buf, recSize, ipInt) {
+  if (!buf) return -1;
+  let lo = 0;
+  let hi = buf.length / recSize - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const off = mid * recSize;
+    const start = buf.readUInt32BE(off);
+    if (ipInt < start) {
+      hi = mid - 1;
+    } else if (ipInt > buf.readUInt32BE(off + 4)) {
+      lo = mid + 1;
+    } else {
+      return off;
+    }
+  }
+  return -1;
+}
+
+function geoCountry(ip) {
+  const ipInt = ipToInt(ip);
+  if (ipInt === 0) return null;
+  const off = geoRangeLookup(geoDb.countryBuf, 9, ipInt);
+  if (off === -1) return null;
+  return geoDb.countries[geoDb.countryBuf.readUInt8(off + 8)] || null;
+}
+
+// Returns the datacenter org name when the IP's ASN classified as
+// hosting/cloud at build time, else null (residential/unknown).
+function asnDatacenterOrg(ip) {
+  const ipInt = ipToInt(ip);
+  if (ipInt === 0) return null;
+  const off = geoRangeLookup(geoDb.asnBuf, 10, ipInt);
+  if (off === -1) return null;
+  const orgIdx = geoDb.asnBuf.readUInt16BE(off + 8);
+  if (orgIdx === 0xFFFF) return null;
+  return geoDb.dcOrgs[orgIdx] || null;
+}
+
+// =============================================================================
+// RISK SCORING (the "intelligent" ladder — D50)
+//
+// Computed ONLY for the scorable surface: anonymous GET requests that would
+// render HTML (no trust cookie, no pass cookie, not a verified crawler, not
+// static, not /api). Each signal is weak alone; the sum crossing
+// SCORE_THRESHOLD serves the existing Turnstile challenge (managed mode:
+// invisible to genuine browsers, a wall to headless fleets) — NEVER a hard
+// block. The repo's history is explicit that aggregate heuristics
+// misidentify humans (see the removed UA-velocity/version-span rules): every
+// action here is recoverable by proving humanity once.
+//
+// The 2026-07/08 residential-proxy swarm this is built against: 15 309 IPs
+// in 3.4 days, 89% seen on a single day only (per-IP counters structurally
+// useless), flawless modern Chrome UAs over h2/h3, crawling the non-default
+// locale catalog, executing GA (the analytics-pollution motive). What it
+// cannot fake cheaply: coherent Chromium header sets from non-browser
+// stacks, residential geography matched to audience, cookie persistence,
+// and — under pressure — the Turnstile solve per fresh exit IP.
+// =============================================================================
+
+const SCORE_WEIGHTS = {
+  dc_asn: 40,                  // hosting/cloud ASN (GeoDB) — no real users browse from VMs
+  dc_cidr: 40,                 // curated CLOUD_PROVIDER_CIDRS fallback (works without GeoDB)
+  high_risk_country: 25,       // audience prior (HIGH_RISK_COUNTRIES)
+  no_sec_fetch: 40,            // claims Chrome >=80 but no Sec-Fetch-* — impossible for real Chrome
+  no_sec_ch_ua: 30,            // claims Chrome >=90 but no sec-ch-ua — ditto
+  platform_mismatch: 40,       // sec-ch-ua-platform contradicts the UA's OS
+  no_accept_language: 20,      // browser-like UA without Accept-Language
+  locale_lang_mismatch: 15,    // reads /ja/ but Accept-Language has no ja
+  cookieless_same_origin: 25,  // claims in-site navigation with an empty cookie jar
+  cookieless_deep_direct: 10,  // cookieless, referer-less entry straight to deep content
+};
+
+// UA OS family <-> sec-ch-ua-platform values (both sides normalized).
+function uaOsFamily(ua) {
+  if (/Windows NT/.test(ua)) return 'Windows';
+  if (/Android/.test(ua)) return 'Android';
+  if (/iPhone|iPad/.test(ua)) return 'iOS';
+  if (/CrOS/.test(ua)) return 'Chrome OS';
+  if (/Mac OS X/.test(ua)) return 'macOS';
+  if (/Linux|X11/.test(ua)) return 'Linux';
+  return null;
+}
+
+// Sliding 5-minute pressure window over scorable requests. Minute buckets;
+// surgeTick() is called once per scorable request and returns the 5-min sum.
+const surgeBuckets = new Array(5).fill(0);
+let surgeMinute = Math.floor(Date.now() / 60000);
+
+function surgeTick() {
+  const minute = Math.floor(Date.now() / 60000);
+  if (minute !== surgeMinute) {
+    const gap = Math.min(5, minute - surgeMinute);
+    for (let i = 1; i <= gap; i++) {
+      surgeBuckets[(surgeMinute + i) % 5] = 0;
+    }
+    surgeMinute = minute;
+  }
+  surgeBuckets[minute % 5]++;
+  return surgeBuckets.reduce((a, b) => a + b, 0);
+}
+
+/**
+ * Is this request part of the scorable surface? HTML-rendering anonymous GETs
+ * only — POSTs (webhooks, forms), API paths, health checks and non-HTML
+ * Accept headers are never challenged by the ladder.
+ */
+function isScorableRequest(headers, requestPath) {
+  const method = (headers['x-forwarded-method'] || 'GET').toUpperCase();
+  if (method !== 'GET') return false;
+  if (requestPath.startsWith('/api/')) return false;
+  if (requestPath.startsWith('/internal-api/')) return false;
+  if (requestPath.startsWith('/webhook')) return false;
+  if (requestPath.startsWith('/-/')) return false;
+  if (requestPath.startsWith('/.well-known/')) return false;
+  const accept = headers['accept'] || '';
+  if (accept && !accept.includes('text/html') && !accept.includes('*/*')) return false;
+  return true;
+}
+
+/**
+ * Pure scoring function — rate5m is passed in (tests need determinism).
+ * Returns { score, base, pressure, components }.
+ */
+function computeRiskScore(ip, userAgent, requestPath, headers, rate5m) {
+  const ua = userAgent || '';
+  const components = {};
+
+  // --- IP reputation ---------------------------------------------------------
+  const dcOrg = asnDatacenterOrg(ip);
+  if (dcOrg) {
+    components.dc_asn = SCORE_WEIGHTS.dc_asn;
+  } else if (isCloudProviderIP(ip)) {
+    components.dc_cidr = SCORE_WEIGHTS.dc_cidr;
+  }
+  const country = geoCountry(ip);
+  if (country && HIGH_RISK_COUNTRIES.has(country)) {
+    components.high_risk_country = SCORE_WEIGHTS.high_risk_country;
+  }
+
+  // --- Header coherence (Chromium-claimed UAs only: Safari/Firefox/CriOS
+  // legitimately omit these headers, so they are never scored on them) -------
+  const chromeMatch = /Chrome\/(\d+)\./.exec(ua);
+  const isChromiumClaim = chromeMatch !== null && !/CriOS/.test(ua);
+  const chromeMajor = isChromiumClaim ? parseInt(chromeMatch[1], 10) : 0;
+  if (isChromiumClaim && chromeMajor >= 80 && !headers['sec-fetch-site']) {
+    components.no_sec_fetch = SCORE_WEIGHTS.no_sec_fetch;
+  }
+  if (isChromiumClaim && chromeMajor >= 90 && !headers['sec-ch-ua']) {
+    components.no_sec_ch_ua = SCORE_WEIGHTS.no_sec_ch_ua;
+  }
+  const platformHeader = (headers['sec-ch-ua-platform'] || '').replace(/"/g, '').trim();
+  if (isChromiumClaim && platformHeader) {
+    const uaOs = uaOsFamily(ua);
+    if (uaOs && platformHeader !== uaOs) {
+      components.platform_mismatch = SCORE_WEIGHTS.platform_mismatch;
+    }
+  }
+
+  // --- Language / locale coherence ------------------------------------------
+  const acceptLanguage = headers['accept-language'] || '';
+  if (!acceptLanguage && /Mozilla\/5\.0/.test(ua)) {
+    components.no_accept_language = SCORE_WEIGHTS.no_accept_language;
+  }
+  const locale = extractLocale(requestPath);
+  if (locale && acceptLanguage && !acceptLanguage.toLowerCase().includes(locale)) {
+    components.locale_lang_mismatch = SCORE_WEIGHTS.locale_lang_mismatch;
+  }
+
+  // --- Cookie persistence (the "new GA user per hit" signature) -------------
+  const hasCookies = Boolean(headers['cookie']);
+  if (!hasCookies && headers['sec-fetch-site'] === 'same-origin') {
+    components.cookieless_same_origin = SCORE_WEIGHTS.cookieless_same_origin;
+  }
+  if (!hasCookies && !headers['referer']
+    && requestPath.split('?')[0].split('/').filter(Boolean).length >= 2) {
+    components.cookieless_deep_direct = SCORE_WEIGHTS.cookieless_deep_direct;
+  }
+
+  // --- Pressure: auto-tighten under distributed crawl -----------------------
+  const pressure = rate5m / SURGE_BASELINE_5M;
+  if (pressure > 2 && locale && !hasCookies) {
+    components.surge_locale_cookieless = SURGE_EXTRA_SCORE;
+  }
+
+  let base = 0;
+  for (const value of Object.values(components)) base += value;
+  const multiplier = Math.min(2.5, Math.max(1, pressure));
+  const score = Math.round(base * multiplier);
+
+  return { score, base, pressure: Math.round(pressure * 100) / 100, components };
+}
+
+// =============================================================================
 // LOGGING WITH DAILY ROTATION
 // =============================================================================
 
@@ -448,9 +846,10 @@ function getLogFilePath() {
   return path.join(LOG_DIR, `blocked-${today}.log`);
 }
 
-function logBlocked(type, ip, userAgent, reason, requestPath) {
+function logBlocked(type, ip, userAgent, reason, requestPath, extra) {
   const timestamp = new Date().toISOString();
   const logEntry = { timestamp, type, ip, userAgent, reason, path: requestPath };
+  if (extra) logEntry.extra = extra;  // structured payload (risk-score components)
   const logLine = JSON.stringify(logEntry) + '\n';
 
   console.log(`[${type.toUpperCase()}] ${ip} - ${reason} - ${userAgent.substring(0, 80)}`);
@@ -827,6 +1226,18 @@ setInterval(() => {
     }
   }
 
+  // Clean expired rDNS verdicts and whitelisted-crawler buckets
+  for (const [ip, record] of rdnsCache) {
+    if (record.exp <= now) {
+      rdnsCache.delete(ip);
+    }
+  }
+  for (const [key, record] of crawlerBuckets) {
+    if (now - record.windowStart > 120000) {
+      crawlerBuckets.delete(key);
+    }
+  }
+
 }, 5 * 60 * 1000).unref(); // unref: don't hold the process open (tests require this module)
 
 // =============================================================================
@@ -888,6 +1299,63 @@ function hasValidPassCookie(cookieHeader, ip) {
   const actual = raw.slice(dot + 1);
   if (actual.length !== expected.length) return false;
   return crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+}
+
+// =============================================================================
+// TRUSTED-HUMAN COOKIE (__bb_trust) — validation only, the app issues it
+// =============================================================================
+
+function getCookieValue(cookieHeader, name) {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq === -1) continue;
+    if (part.slice(0, eq).trim() === name) {
+      return part.slice(eq + 1).trim();
+    }
+  }
+  return null;
+}
+
+function b64urlDecode(value) {
+  return Buffer.from(value.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+}
+
+/**
+ * Validates the app-issued trust cookie. Returns the opaque uid (for abuse
+ * telemetry — one uid fanning out over many IPs would mean a registered
+ * scraper account) or null. Not IP-bound by design; see the config comment.
+ */
+function getTrustedUid(cookieHeader) {
+  if (!TRUST_ENABLED) return null;
+  const raw = getCookieValue(cookieHeader, TRUST_COOKIE_NAME);
+  if (!raw) return null;
+
+  const dot = raw.lastIndexOf('.');
+  if (dot === -1) return null;
+
+  let payload;
+  let actual;
+  try {
+    payload = b64urlDecode(raw.slice(0, dot));
+    actual = b64urlDecode(raw.slice(dot + 1));
+  } catch (e) {
+    return null;
+  }
+
+  const expected = crypto.createHmac('sha256', TRUST_COOKIE_SECRET).update(payload).digest();
+  if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+    return null;
+  }
+
+  const parts = payload.toString('utf8').split('|');  // bb-trust|v1|<uid>|<iatMs>
+  if (parts.length !== 4 || parts[0] !== 'bb-trust' || parts[1] !== 'v1') return null;
+
+  const issuedAt = parseInt(parts[3], 10);
+  if (!Number.isFinite(issuedAt) || Date.now() > issuedAt + TRUST_COOKIE_TTL_MS) return null;
+  if (parts[2] === '') return null;
+
+  return parts[2];
 }
 
 /**
@@ -1282,12 +1750,31 @@ async function handleRequest(req, res) {
     return;
   }
 
-  // Whitelist search engine bots and social media crawlers - bypass all blocking
-  const whitelistedBotName = isWhitelistedBot(userAgent);
-  if (whitelistedBotName) {
-    res.writeHead(200);
-    res.end('OK');
-    return;
+  // Whitelist search engine bots and social media crawlers. Verified (rDNS)
+  // crawlers pass unlimited; UA-only entries pass under a per-IP cap; refuted
+  // impersonators ("Googlebot" from a Hetzner VM) fall through to the normal
+  // pipeline below — no privileges, no instant block.
+  const whitelisted = await checkWhitelistedBot(userAgent, ip);
+  if (whitelisted) {
+    if (whitelisted.allow) {
+      res.writeHead(200);
+      res.end('OK');
+      return;
+    }
+    if (whitelisted.capped) {
+      logBlocked('crawler_capped', ip, userAgent,
+        `${whitelisted.name} over ${WHITELIST_BOT_CAP}/min per-IP crawler cap`, requestPath);
+      res.writeHead(429, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Retry-After': '60',
+        'X-Blocked-Reason': 'crawler_cap',
+      });
+      res.end(RATE_LIMITED_HTML);
+      return;
+    }
+    // whitelisted.fake — log once per request and continue the pipeline
+    logBlocked('fake_crawler', ip, userAgent,
+      `UA claims ${whitelisted.name} but rDNS does not confirm it`, requestPath);
   }
 
   // Challenge solve callback (?__bb_token=...). MUST run before the blocking
@@ -1330,6 +1817,19 @@ async function handleRequest(req, res) {
       res.end();
       return;
     }
+  }
+
+  // Trusted human: the app vouched for this browser (logged-in account, see
+  // the __bb_trust config comment). Full bypass — including permabans and
+  // rate limits: competition venues put 1000+ real users behind one WiFi IP,
+  // and a ban earned by one device must never lock out the logged-in rest.
+  // The uid is opaque (no PII); a single uid fanning out across many IPs in
+  // the daily logs would expose a registered scraper account.
+  const trustedUid = getTrustedUid(req.headers['cookie']);
+  if (trustedUid) {
+    res.writeHead(200);
+    res.end('OK');
+    return;
   }
 
   // A valid pass cookie bypasses ONLY the challenge-eligible heuristics below
@@ -1420,7 +1920,10 @@ async function handleRequest(req, res) {
   // earth. The riskiest heuristic we run (5.1k distinct IPs / 8 days); any
   // real human inside gets a way through, the botnet doesn't solve widgets.
   if (!hasPass && isChineseBotnet(ip, userAgent)) {
-    const reason = 'Chinese cloud botnet (43.x + HTTP/1.1 + outdated Chrome)';
+    // Reason string updated 2026-08 (was "...HTTP/1.1 + outdated Chrome"):
+    // the rule matches ANY Chrome version and never saw protocol — the old
+    // wording misdescribed what fired 35k+ times during the July wave.
+    const reason = 'Chinese cloud botnet (43.x + Windows 10 + Chrome)';
     logBlocked('botnet', ip, userAgent, reason, requestPath);
     serveChallengeOrBlock(res, reason, 'chinese_botnet');
     return;
@@ -1514,6 +2017,31 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // Risk-scoring ladder (D50) — the LAST gate, after every deterministic rule
+  // passed. Scores the anonymous HTML surface; above the threshold it serves
+  // the Turnstile challenge (managed mode: invisible to genuine browsers).
+  // Pass-cookie holders already proved humanity — never re-scored within the
+  // cookie's lifetime. In 'log' (shadow) mode nothing is ever acted on.
+  if (SCORING_MODE !== 'off' && !hasPass && isScorableRequest(req.headers, requestPath)) {
+    const rate5m = surgeTick();
+    const risk = computeRiskScore(ip, userAgent, requestPath, req.headers, rate5m);
+    if (risk.score >= SCORE_THRESHOLD) {
+      const detail = `Risk score ${risk.score} (base ${risk.base} × pressure ${risk.pressure})`;
+      // Challenge only when the challenge stack is live — a heuristic score
+      // must NEVER produce a hard 403, so without Turnstile keys we shadow-log.
+      if (SCORING_MODE === 'challenge' && CHALLENGE_ENABLED) {
+        logBlocked('risk_challenge', ip, userAgent, detail, requestPath, risk);
+        serveChallengeOrBlock(res, 'Automated traffic suspected', 'risk_score');
+        return;
+      }
+      logBlocked('risk_shadow', ip, userAgent, detail, requestPath, risk);
+    } else if (risk.score >= SCORE_LOG_MIN) {
+      // Sub-threshold observability: the shadow phase tunes the threshold
+      // from this distribution instead of guessing.
+      logBlocked('risk_observe', ip, userAgent, `Risk score ${risk.score}`, requestPath, risk);
+    }
+  }
+
   // Allow request
   res.writeHead(200);
   res.end('OK');
@@ -1529,11 +2057,14 @@ if (require.main === module) {
 
 ensureLogDir();
 loadBannedIPs();
+initGeoDb(GEODB_DIR);
 
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
   console.log(`Challenge: ${CHALLENGE_ENABLED ? `ENABLED (cookie TTL ${CHALLENGE_COOKIE_TTL_MS / 86400000}d)` : 'disabled (missing TURNSTILE_SITE_KEY/TURNSTILE_SECRET_KEY/CHALLENGE_COOKIE_SECRET or CHALLENGE_ENABLED=false)'}`);
+  console.log(`Trust cookie: ${TRUST_ENABLED ? `ENABLED (TTL ${TRUST_COOKIE_TTL_MS / 86400000}d)` : 'disabled (no TRUST_COOKIE_SECRET/CHALLENGE_COOKIE_SECRET)'}`);
+  console.log(`Risk scoring: ${SCORING_MODE} (threshold ${SCORE_THRESHOLD}, baseline ${SURGE_BASELINE_5M}/5min, high-risk: ${[...HIGH_RISK_COUNTRIES].join(',') || 'none'})`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
   console.log(`Page scrape detection: ${PUZZLE_SCRAPE_THRESHOLD} puzzles/${PUZZLE_SCRAPE_WINDOW / 1000}s, ${PROFILE_SCRAPE_THRESHOLD} profiles/${PROFILE_SCRAPE_WINDOW / 1000}s, ${SCRAPE_STRIKES_FOR_BAN} strikes to ban`);
   console.log(`Cloud botnet CIDR ranges: ${CLOUD_PROVIDER_CIDRS.length} (requires X-Original-Protocol header)`);
@@ -1563,4 +2094,23 @@ module.exports = {
   CHALLENGE_ENABLED,
   CHALLENGE_COOKIE_NAME,
   CHALLENGE_TOKEN_PARAM,
+  // Trust cookie
+  getTrustedUid,
+  TRUST_COOKIE_NAME,
+  // Risk scoring
+  computeRiskScore,
+  isScorableRequest,
+  uaOsFamily,
+  SCORE_WEIGHTS,
+  SCORE_THRESHOLD,
+  // GeoDB
+  initGeoDb,
+  geoCountry,
+  asnDatacenterOrg,
+  // Crawler verification
+  checkWhitelistedBot,
+  verifyCrawlerRdns,
+  _setDnsForTests,
+  isCrawlerCapped,
+  WHITELIST_BOT_CAP,
 };
