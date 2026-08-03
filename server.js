@@ -1452,9 +1452,9 @@ function logChallenge(event, ip, userAgent, detail, requestPath) {
  * already logged by the caller with its original type/reason — behavior
  * stats stay comparable with pre-challenge history.
  */
-function serveChallengeOrBlock(res, reason, headerReason) {
+function serveChallengeOrBlock(res, reason, headerReason, locale = 'en', ip = '') {
   if (!CHALLENGE_ENABLED) {
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    const html = renderPage('blocked', { reason, locale, ip });
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': headerReason,
@@ -1462,7 +1462,7 @@ function serveChallengeOrBlock(res, reason, headerReason) {
     res.end(html);
     return;
   }
-  const html = CHALLENGE_HTML.replace(/\{\{REASON\}\}/g, reason);
+  const html = renderPage('challenge', { reason, locale, ip });
   res.writeHead(403, {
     'Content-Type': 'text/html; charset=utf-8',
     'X-Blocked-Reason': headerReason,
@@ -1476,231 +1476,205 @@ function serveChallengeOrBlock(res, reason, headerReason) {
 // HTML TEMPLATES
 // =============================================================================
 
-const RATE_LIMITED_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Access Blocked</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-      max-width: 480px;
-      width: 100%;
-      padding: 48px 40px;
-      text-align: center;
-    }
-    .icon {
-      font-size: 64px;
-      margin-bottom: 24px;
-    }
-    h1 {
-      color: #1a202c;
-      font-size: 24px;
-      font-weight: 700;
-      margin-bottom: 16px;
-    }
-    p {
-      color: #4a5568;
-      font-size: 16px;
-      line-height: 1.6;
-      margin-bottom: 24px;
-    }
-    .contact {
-      background: #f7fafc;
-      border-radius: 12px;
-      padding: 20px;
-    }
-    .contact a {
-      color: #667eea;
-      text-decoration: none;
-      font-weight: 600;
-    }
-    .contact a:hover {
-      text-decoration: underline;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">&#128683;</div>
-    <h1>Access Blocked</h1>
-    <p>Due to suspicious activity (too many requests in short period of time), you have been blocked.</p>
-    <div class="contact">
-      <p style="margin-bottom: 0;">If this is a mistake or you would like to be un-blocked and start official collaboration, please reach out to us at <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a></p>
-    </div>
-  </div>
-</body>
-</html>`;
+// -----------------------------------------------------------------------------
+// Brand system (MySpeedPuzzling). These pages are the only thing a wrongly-
+// caught human ever sees, so they carry the site's own look: real logo and
+// Rubik webfont pulled from myspeedpuzzling.com itself. That works because the
+// ASSETS router (compose.yaml, priority 100) carries neither the bot-blocker
+// nor the CrowdSec bouncer — a blocked client can still fetch /img and /fonts,
+// verified in production. Everything else is inline: no CDN, no build step.
+// Colors are the app's SCSS variables (assets/styles/_variables.scss):
+// primary #fe696a, headings #373f50, body #4b566b, gray-100 #f6f9fc.
+// -----------------------------------------------------------------------------
 
-const BOT_BLOCKED_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Access Blocked</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-      max-width: 520px;
-      width: 100%;
-      padding: 48px 40px;
-      text-align: center;
-    }
-    .icon {
-      font-size: 64px;
-      margin-bottom: 24px;
-    }
-    h1 {
-      color: #1a202c;
-      font-size: 24px;
-      font-weight: 700;
-      margin-bottom: 16px;
-    }
-    p {
-      color: #4a5568;
-      font-size: 16px;
-      line-height: 1.6;
-      margin-bottom: 20px;
-    }
-    .reason {
-      background: #fff5f5;
-      border: 1px solid #feb2b2;
-      border-radius: 8px;
-      padding: 16px;
-      margin-bottom: 24px;
-      font-family: monospace;
-      font-size: 13px;
-      color: #c53030;
-      word-break: break-all;
-      text-align: left;
-    }
-    .contact {
-      background: #f7fafc;
-      border-radius: 12px;
-      padding: 20px;
-    }
-    .contact a {
-      color: #f5576c;
-      text-decoration: none;
-      font-weight: 600;
-    }
-    .contact a:hover {
-      text-decoration: underline;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">&#129302;</div>
-    <h1>Bot Detected</h1>
-    <p>Your request has been blocked by our automated protection system.</p>
-    <div class="reason">
-      <strong>Reason:</strong> {{REASON}}
-    </div>
-    <div class="contact">
-      <p style="margin-bottom: 0;">If this is a mistake or you would like to start official collaboration, please contact <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a></p>
-    </div>
-  </div>
-</body>
-</html>`;
+const BRAND_CSS = `
+@font-face{font-family:Rubik;font-style:normal;font-weight:300 700;font-display:swap;src:url(/fonts/rubik/rubik-latin-ext.woff2) format("woff2");unicode-range:U+0100-02BA,U+02BD-02C5,U+02C7-02CC,U+02CE-02D7,U+02DD-02FF,U+0304,U+0308,U+0329,U+1D00-1DBF,U+1E00-1E9F,U+1EF2-1EFF,U+2020,U+20A0-20AB,U+20AD-20C0,U+2113,U+2C60-2C7F,U+A720-A7FF}
+@font-face{font-family:Rubik;font-style:normal;font-weight:300 700;font-display:swap;src:url(/fonts/rubik/rubik-latin.woff2) format("woff2");unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
+:root{
+  color-scheme:light dark;
+  --brand:#fe696a; --brand-soft:rgba(254,105,106,.1);
+  --ink:#373f50; --body:#4b566b; --muted:#7d879c;
+  --bg:#f6f9fc; --card:#fff; --line:#e3e9ef;
+}
+@media (prefers-color-scheme:dark){
+  :root{--ink:#f3f5f9; --body:#c8cfda; --muted:#9aa3ae; --bg:#1c2130; --card:#242b3d; --line:#333c52;}
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:Rubik,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  background:var(--bg); color:var(--body);
+  font-size:15px; line-height:1.6;
+  min-height:100vh; display:flex; align-items:center; justify-content:center;
+  padding:24px 16px;
+}
+.card{
+  background:var(--card); border-radius:14px; border:1px solid var(--line);
+  box-shadow:0 18px 40px -24px rgba(55,63,80,.45);
+  max-width:32rem; width:100%; padding:40px 32px 32px; text-align:center;
+}
+.logo{height:52px;width:auto;margin:0 auto 20px;display:block}
+h1{color:var(--ink);font-size:22px;font-weight:500;line-height:1.3;margin-bottom:12px}
+p{margin-bottom:16px}
+.widget{display:flex;justify-content:center;min-height:66px;margin:24px 0 8px}
+.foot{
+  margin-top:24px;padding-top:20px;border-top:1px solid var(--line);
+  font-size:13.5px;color:var(--muted);
+}
+a{color:var(--brand);text-decoration:none;font-weight:500}
+a:hover{text-decoration:underline}
+details{margin-top:16px;text-align:left}
+summary{
+  cursor:pointer;font-size:12.5px;color:var(--muted);text-align:center;
+  list-style:none;padding:4px;
+}
+summary::-webkit-details-marker{display:none}
+summary:hover{color:var(--brand)}
+.reason{
+  margin-top:10px;padding:10px 12px;border-radius:8px;background:var(--brand-soft);
+  font:12px/1.7 ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--body);
+  word-break:break-word;
+}
+.reason span{color:var(--muted)}
+@media (max-width:420px){.card{padding:32px 20px 24px}h1{font-size:20px}}
+`;
 
-// Challenge page — served with 403 for challenge-eligible blocks. The widget
-// JS loads from Cloudflare's CDN (reachable — only OUR origin blocks the
-// client); on success the page reloads the SAME URL with the token appended
-// (this 403 body renders at the URL the user requested, so location.href IS
-// the original URL). No-JS clients still get the reason + contact fallback.
-const CHALLENGE_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="robots" content="noindex, nofollow">
-  <title>One more step</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 20px;
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-      max-width: 520px;
-      width: 100%;
-      padding: 48px 40px;
-      text-align: center;
-    }
-    .icon { font-size: 64px; margin-bottom: 24px; }
-    h1 { color: #1a202c; font-size: 24px; font-weight: 700; margin-bottom: 16px; }
-    p { color: #4a5568; font-size: 16px; line-height: 1.6; margin-bottom: 20px; }
-    .widget {
-      display: flex;
-      justify-content: center;
-      min-height: 66px;
-      margin-bottom: 24px;
-    }
-    .reason {
-      background: #f7fafc;
-      border: 1px solid #e2e8f0;
-      border-radius: 8px;
-      padding: 12px;
-      margin-bottom: 24px;
-      font-family: monospace;
-      font-size: 12px;
-      color: #718096;
-      word-break: break-all;
-      text-align: left;
-    }
-    .contact { background: #f7fafc; border-radius: 12px; padding: 20px; font-size: 14px; }
-    .contact a { color: #667eea; text-decoration: none; font-weight: 600; }
-    .contact a:hover { text-decoration: underline; }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">&#128075;</div>
-    <h1>Quick check &mdash; are you human?</h1>
-    <p>Your browser matched a pattern our bot protection watches for.
-       Complete the check below and you'll continue straight to the page.</p>
+// Six locales — the site's own set. A wrongly-challenged Czech puzzler should
+// not have to read an English apology. Locale comes from the URL prefix first
+// (authoritative: the app's own routing), Accept-Language second.
+const PAGE_STRINGS = {
+  en: {
+    lang: 'en',
+    challengeTitle: 'Sorry to bother you!',
+    challengeBody: 'We just need to make sure you are a real puzzler and not a bot. It takes a second &mdash; then you continue straight to the page you wanted.',
+    rateTitle: 'Whoa, that was fast!',
+    rateBody: 'A lot of requests arrived from your connection in a short time, so we have paused things for a minute. Please try again shortly.',
+    blockedTitle: 'We stopped this request',
+    blockedBody: 'Our bot protection blocked this one. If you are a real puzzler seeing this by mistake, we are sorry &mdash; write to us and we will fix it right away.',
+    helpLead: 'Something not right? Email',
+    helpTail: 'and we will sort it out.',
+    details: 'Technical details',
+    labelReason: 'Reason',
+    labelIp: 'Your IP address',
+  },
+  cs: {
+    lang: 'cs',
+    challengeTitle: 'Omlouv&aacute;me se za zdr&#382;en&iacute;!',
+    challengeBody: 'Jen se ujist&iacute;me, &#382;e jsi skute&#269;n&yacute; puzzlista a ne robot. Zabere to chvilku &mdash; pak budeš pokra&#269;ovat rovnou na str&aacute;nku, kterou chceš.',
+    rateTitle: 'Hola, to bylo rychl&eacute;!',
+    rateBody: 'Z tv&eacute;ho p&#345;ipojen&iacute; p&#345;išlo za kr&aacute;tkou dobu hodn&#283; po&#382;adavk&#367;, tak jsme to na chvilku pozastavili. Zkus to pros&iacute;m za minutku znovu.',
+    blockedTitle: 'Tento po&#382;adavek jsme zastavili',
+    blockedBody: 'Naše ochrana proti robot&#367;m tenhle po&#382;adavek zablokovala. Pokud jsi skute&#269;n&yacute; puzzlista a vid&iacute;š to omylem, mrz&iacute; n&aacute;s to &mdash; napiš n&aacute;m a hned to spravíme.',
+    helpLead: 'N&#283;co nen&iacute; v po&#345;&aacute;dku? Napiš na',
+    helpTail: 'a vy&#345;eš&iacute;me to.',
+    details: 'Technick&eacute; detaily',
+    labelReason: 'D&#367;vod',
+    labelIp: 'Tvoje IP adresa',
+  },
+  de: {
+    lang: 'de',
+    challengeTitle: 'Entschuldige die St&ouml;rung!',
+    challengeBody: 'Wir pr&uuml;fen nur kurz, ob du ein echter Puzzler bist und kein Bot. Das dauert einen Moment &mdash; danach geht es direkt weiter zu deiner Seite.',
+    rateTitle: 'Oha, das ging schnell!',
+    rateBody: 'Von deiner Verbindung kamen in kurzer Zeit sehr viele Anfragen, deshalb pausieren wir kurz. Bitte versuche es in einer Minute noch einmal.',
+    blockedTitle: 'Diese Anfrage haben wir gestoppt',
+    blockedBody: 'Unser Bot-Schutz hat sie blockiert. Wenn du ein echter Puzzler bist und das zu Unrecht siehst, tut es uns leid &mdash; schreib uns, wir kl&auml;ren das sofort.',
+    helpLead: 'Etwas stimmt nicht? Schreib an',
+    helpTail: 'und wir k&uuml;mmern uns darum.',
+    details: 'Technische Details',
+    labelReason: 'Grund',
+    labelIp: 'Deine IP-Adresse',
+  },
+  es: {
+    lang: 'es',
+    challengeTitle: '&iexcl;Perdona la molestia!',
+    challengeBody: 'Solo comprobamos que eres una persona y no un bot. Tarda un momento y despu&eacute;s sigues directo a la p&aacute;gina que quer&iacute;as.',
+    rateTitle: '&iexcl;Vaya, qu&eacute; rapidez!',
+    rateBody: 'Han llegado muchas peticiones desde tu conexi&oacute;n en poco tiempo, as&iacute; que hemos hecho una pausa. Int&eacute;ntalo de nuevo en un minuto.',
+    blockedTitle: 'Hemos detenido esta petici&oacute;n',
+    blockedBody: 'Nuestra protecci&oacute;n antibots la ha bloqueado. Si eres una persona y ves esto por error, lo sentimos: escr&iacute;benos y lo arreglamos enseguida.',
+    helpLead: '&iquest;Algo no va bien? Escribe a',
+    helpTail: 'y lo solucionamos.',
+    details: 'Detalles t&eacute;cnicos',
+    labelReason: 'Motivo',
+    labelIp: 'Tu direcci&oacute;n IP',
+  },
+  fr: {
+    lang: 'fr',
+    challengeTitle: 'D&eacute;sol&eacute; de te d&eacute;ranger&nbsp;!',
+    challengeBody: 'On v&eacute;rifie simplement que tu es un vrai puzzleur et pas un robot. C&rsquo;est l&rsquo;affaire d&rsquo;un instant &mdash; ensuite tu continues vers ta page.',
+    rateTitle: 'Oh l&agrave;, quelle vitesse&nbsp;!',
+    rateBody: 'Beaucoup de requ&ecirc;tes sont arriv&eacute;es depuis ta connexion en peu de temps, alors on fait une petite pause. R&eacute;essaie dans une minute.',
+    blockedTitle: 'Nous avons arr&ecirc;t&eacute; cette requ&ecirc;te',
+    blockedBody: 'Notre protection anti-robots l&rsquo;a bloqu&eacute;e. Si tu es un vrai puzzleur et que tu vois ceci par erreur, d&eacute;sol&eacute; &mdash; &eacute;cris-nous et on corrige tout de suite.',
+    helpLead: 'Un souci&nbsp;? &Eacute;cris &agrave;',
+    helpTail: 'et on s&rsquo;en occupe.',
+    details: 'D&eacute;tails techniques',
+    labelReason: 'Motif',
+    labelIp: 'Ton adresse IP',
+  },
+  ja: {
+    lang: 'ja',
+    challengeTitle: 'お手数をおかけします！',
+    challengeBody: 'ボットではなく本物のパズラーであることを確認しています。すぐに終わり、そのまま目的のページに進めます。',
+    rateTitle: 'アクセスが少し速すぎるようです',
+    rateBody: '短時間に多くのリクエストが届いたため、少しの間お待ちいただいています。1分ほどしてからもう一度お試しください。',
+    blockedTitle: 'このリクエストを停止しました',
+    blockedBody: 'ボット対策によりブロックされました。本物のパズラーの方に誤って表示されている場合は申し訳ありません。ご連絡いただければすぐに対応します。',
+    helpLead: 'うまくいかない場合は',
+    helpTail: 'までご連絡ください。',
+    details: '技術的な詳細',
+    labelReason: '理由',
+    labelIp: 'あなたのIPアドレス',
+  },
+};
+
+function detectPageLocale(requestPath, acceptLanguage) {
+  const fromPath = /^\/(en|cs|de|es|fr|ja)(\/|$)/i.exec(requestPath || '');
+  if (fromPath) return fromPath[1].toLowerCase();
+  const header = (acceptLanguage || '').toLowerCase();
+  for (const code of ['cs', 'ja', 'de', 'es', 'fr']) {
+    if (header.startsWith(code) || header.includes(`,${code}`) || header.includes(` ${code}`)) return code;
+  }
+  return 'en';
+}
+
+// Reasons are server-side constants, but they interpolate counters and locale
+// names — escape anyway. A block page must never become an injection surface.
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/**
+ * Renders one of the three visitor-facing pages.
+ *   kind: 'challenge' | 'ratelimit' | 'blocked'
+ * The challenge page keeps its exact solve mechanics (widget + __bbSolved
+ * callback appending the token to the current URL) — only the wrapper changed.
+ */
+function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
+  const t = PAGE_STRINGS[locale] || PAGE_STRINGS.en;
+  const title = kind === 'challenge' ? t.challengeTitle : kind === 'ratelimit' ? t.rateTitle : t.blockedTitle;
+  const body = kind === 'challenge' ? t.challengeBody : kind === 'ratelimit' ? t.rateBody : t.blockedBody;
+
+  const widget = kind === 'challenge' ? `
     <div class="widget">
       <div class="cf-turnstile" data-sitekey="${TURNSTILE_SITE_KEY}" data-callback="__bbSolved"></div>
-    </div>
-    <div class="reason"><strong>Matched rule:</strong> {{REASON}}</div>
-    <div class="contact">
-      <p style="margin-bottom: 0;">No luck, or no JavaScript? Email <a href="mailto:${CONTACT_EMAIL}">${CONTACT_EMAIL}</a> and we'll sort it out.</p>
-    </div>
-  </div>
+    </div>` : '';
+
+  // Reason AND client IP: everything a wrongly-blocked visitor needs to paste
+  // into a support mail, so Jan can allowlist the exact address (D47 pattern).
+  const detailRows = [
+    reason ? `<div><span>${t.labelReason}:</span> ${escapeHtml(reason)}</div>` : '',
+    ip ? `<div><span>${t.labelIp}:</span> ${escapeHtml(ip)}</div>` : '',
+  ].join('');
+  const details = detailRows ? `
+    <details>
+      <summary>${t.details}</summary>
+      <div class="reason">${detailRows}</div>
+    </details>` : '';
+
+  const scripts = kind === 'challenge' ? `
   <script>
     function __bbSolved(token) {
       try {
@@ -1713,9 +1687,32 @@ const CHALLENGE_HTML = `<!DOCTYPE html>
       }
     }
   </script>
-  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>` : '';
+
+  return `<!DOCTYPE html>
+<html lang="${t.lang}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#fe696a">
+  <title>${title} &mdash; MySpeedPuzzling</title>
+  <style>${BRAND_CSS}</style>
+</head>
+<body>
+  <main class="card">
+    <img class="logo" src="/img/speedpuzzling-logo.svg" alt="MySpeedPuzzling" onerror="this.style.display='none'">
+    <h1>${title}</h1>
+    <p>${body}</p>${widget}
+    <div class="foot">
+      ${t.helpLead} <a href="mailto:${CONTACT_EMAIL}?subject=MySpeedPuzzling%20access">${CONTACT_EMAIL}</a> ${t.helpTail}
+      ${details}
+    </div>
+  </main>${scripts}
 </body>
 </html>`;
+}
+
 
 // =============================================================================
 // HTTP SERVER
@@ -1742,6 +1739,9 @@ async function handleRequest(req, res) {
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
   const requestPath = req.headers['x-forwarded-uri'] || req.url || '/';
   const originalProtocol = req.headers['x-original-protocol'] || '';
+  // Language for any page served below (URL prefix first, then Accept-Language).
+  // Computed once: a wrongly-blocked Czech puzzler reads a Czech apology.
+  const locale = detectPageLocale(requestPath, req.headers['accept-language']);
 
   // Skip rate limiting for static assets
   if (isStaticAsset(requestPath)) {
@@ -1769,7 +1769,7 @@ async function handleRequest(req, res) {
         'Retry-After': '60',
         'X-Blocked-Reason': 'crawler_cap',
       });
-      res.end(RATE_LIMITED_HTML);
+      res.end(renderPage('ratelimit', { locale, ip }));
       return;
     }
     // whitelisted.fake — log once per request and continue the pipeline
@@ -1842,7 +1842,7 @@ async function handleRequest(req, res) {
   if (isPermanentlyBanned(ip)) {
     const info = bannedIPs.get(ip);
     logBlocked('permaban', ip, userAgent, info.reason, requestPath);
-    serveChallengeOrBlock(res, `Permanently banned: ${info.reason}`, 'permaban');
+    serveChallengeOrBlock(res, `Permanently banned: ${info.reason}`, 'permaban', locale, ip);
     return;
   }
 
@@ -1851,7 +1851,7 @@ async function handleRequest(req, res) {
     if (pattern.test(requestPath)) {
       logBlocked('path', ip, userAgent, reason, requestPath);
 
-      const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+      const html = renderPage('blocked', { reason, locale, ip });
 
       res.writeHead(403, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -1873,11 +1873,11 @@ async function handleRequest(req, res) {
       logBlocked('bot', ip, userAgent, reason, requestPath);
 
       if (challenge) {
-        serveChallengeOrBlock(res, reason, reason);
+        serveChallengeOrBlock(res, reason, reason, locale, ip);
         return;
       }
 
-      const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+      const html = renderPage('blocked', { reason, locale, ip });
 
       res.writeHead(403, {
         'Content-Type': 'text/html; charset=utf-8',
@@ -1892,7 +1892,7 @@ async function handleRequest(req, res) {
   if ((!userAgent || userAgent.trim().length === 0) && originalProtocol === 'HTTP/1.1') {
     const reason = 'Empty user agent on HTTP/1.1 (scanner/scraper)';
     logBlocked('bot', ip, userAgent || '', reason, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    const html = renderPage('blocked', { reason, locale, ip });
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'empty_ua',
@@ -1905,7 +1905,7 @@ async function handleRequest(req, res) {
   const subnetBlock = isBlockedSubnet(ip);
   if (subnetBlock) {
     logBlocked('subnet', ip, userAgent, subnetBlock, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, subnetBlock);
+    const html = renderPage('blocked', { reason: subnetBlock, locale, ip });
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'blocked_subnet',
@@ -1925,7 +1925,7 @@ async function handleRequest(req, res) {
     // wording misdescribed what fired 35k+ times during the July wave.
     const reason = 'Chinese cloud botnet (43.x + Windows 10 + Chrome)';
     logBlocked('botnet', ip, userAgent, reason, requestPath);
-    serveChallengeOrBlock(res, reason, 'chinese_botnet');
+    serveChallengeOrBlock(res, reason, 'chinese_botnet', locale, ip);
     return;
   }
 
@@ -1933,7 +1933,7 @@ async function handleRequest(req, res) {
   if (isFakeIOSBot(ip, userAgent)) {
     const reason = 'Fake iOS bot from Chinese cloud';
     logBlocked('botnet', ip, userAgent, reason, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    const html = renderPage('blocked', { reason, locale, ip });
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'fake_ios_bot',
@@ -1947,7 +1947,7 @@ async function handleRequest(req, res) {
   if (cloudProvider) {
     const reason = `Cloud botnet (${cloudProvider} + HTTP/1.1 + Chrome)`;
     logBlocked('cloud_botnet', ip, userAgent, reason, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    const html = renderPage('blocked', { reason, locale, ip });
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'cloud_botnet',
@@ -1962,7 +1962,7 @@ async function handleRequest(req, res) {
   if (isHTTP1Browser(userAgent, originalProtocol)) {
     const reason = 'HTTP/1.1 with browser UA (real browsers use HTTP/2+)';
     logBlocked('http1_browser', ip, userAgent, reason, requestPath);
-    const html = BOT_BLOCKED_HTML.replace(/\{\{REASON\}\}/g, reason);
+    const html = renderPage('blocked', { reason, locale, ip });
     res.writeHead(403, {
       'Content-Type': 'text/html; charset=utf-8',
       'X-Blocked-Reason': 'http1_browser',
@@ -1988,7 +1988,7 @@ async function handleRequest(req, res) {
   if (scrapeResult) {
     if (scrapeResult.banned) {
       logBlocked('page_scrape_ban', ip, userAgent, scrapeResult.reason, requestPath);
-      serveChallengeOrBlock(res, `Permanently banned: ${scrapeResult.reason}`, 'page_scrape_ban');
+      serveChallengeOrBlock(res, `Permanently banned: ${scrapeResult.reason}`, 'page_scrape_ban', locale, ip);
       return;
     } else {
       logBlocked('page_scrape', ip, userAgent,
@@ -1999,7 +1999,7 @@ async function handleRequest(req, res) {
         'Retry-After': '300',
         'X-Blocked-Reason': 'page_scrape',
       });
-      res.end(RATE_LIMITED_HTML);
+      res.end(renderPage('ratelimit', { locale, ip }));
       return;
     }
   }
@@ -2013,7 +2013,7 @@ async function handleRequest(req, res) {
       'Retry-After': '60',
       'X-Blocked-Reason': 'rate_limit',
     });
-    res.end(RATE_LIMITED_HTML);
+    res.end(renderPage('ratelimit', { locale, ip }));
     return;
   }
 
@@ -2031,7 +2031,7 @@ async function handleRequest(req, res) {
       // must NEVER produce a hard 403, so without Turnstile keys we shadow-log.
       if (SCORING_MODE === 'challenge' && CHALLENGE_ENABLED) {
         logBlocked('risk_challenge', ip, userAgent, detail, requestPath, risk);
-        serveChallengeOrBlock(res, 'Automated traffic suspected', 'risk_score');
+        serveChallengeOrBlock(res, 'Automated traffic suspected', 'risk_score', locale, ip);
         return;
       }
       logBlocked('risk_shadow', ip, userAgent, detail, requestPath, risk);
@@ -2107,6 +2107,10 @@ module.exports = {
   initGeoDb,
   geoCountry,
   asnDatacenterOrg,
+  // Visitor-facing pages
+  renderPage,
+  detectPageLocale,
+  PAGE_STRINGS,
   // Crawler verification
   checkWhitelistedBot,
   verifyCrawlerRdns,
