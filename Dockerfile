@@ -2,9 +2,10 @@ FROM --platform=$BUILDPLATFORM node:22-alpine AS geodb
 
 WORKDIR /build
 COPY scripts/build-geodb.mjs scripts/
-# Compiles DB-IP lite (country+ASN) into binary range files. Fails OPEN: on
-# download failure it ships an empty meta.json and the middleware runs with
-# geo/ASN risk signals disabled. The monthly scheduled CI rebuild refreshes it.
+# Compiles DB-IP lite (country+ASN) plus the verified-crawler ASN prefixes
+# (RIPEstat) into binary range files. Fails OPEN: on download failure it ships
+# an empty meta.json and the middleware runs with geo/ASN risk signals disabled
+# and crawlers on their capped UA-only whitelist. Monthly CI rebuild refreshes.
 RUN node scripts/build-geodb.mjs /build/geodb
 
 FROM node:22-alpine

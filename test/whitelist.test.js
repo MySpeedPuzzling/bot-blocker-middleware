@@ -4,6 +4,9 @@
 
 const { test, beforeEach } = require('node:test');
 const assert = require('node:assert');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 process.env.TURNSTILE_SITE_KEY = '1x00000000000000000000AA';
 process.env.TURNSTILE_SECRET_KEY = '1x0000000000000000000000000000000AA';
@@ -12,6 +15,7 @@ process.env.WHITELIST_BOT_CAP = '5';  // small cap so the test loop stays cheap
 
 const {
   checkWhitelistedBot, verifyCrawlerRdns, _setDnsForTests, WHITELIST_BOT_CAP,
+  initGeoDb, crawlerAsn, crawlerAsnDataLoaded,
 } = require('../server.js');
 
 const GOOGLEBOT_UA = 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)';
@@ -127,4 +131,94 @@ test('Stripe stays uncapped and unverified (webhook delivery must never break)',
 test('non-crawler UA claims nothing', async () => {
   assert.strictEqual(await checkWhitelistedBot('Mozilla/5.0 Chrome/150.0.0.0', '1.1.1.1'), null);
   assert.strictEqual(await checkWhitelistedBot('', '1.1.1.1'), null);
+});
+
+// -----------------------------------------------------------------------------
+// ASN-verified crawlers (Meta) — the 2026-08-05 fix
+// -----------------------------------------------------------------------------
+// Meta publishes IP ranges but NO PTR records, so the rDNS path could only ever
+// return 'fake' for them. In 48h that misclassified 50 583 Meta requests and
+// broke link previews for 1 508 facebookexternalhit fetches. These tests pin
+// the replacement: verify by AS32934 membership, and fail OPEN (capped, never
+// 'fake') whenever we have no range data to judge with.
+
+const FB_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
+const META_INDEXER_UA = 'meta-webindexer/1.1';
+
+// Fixture: 57.141.0.0/24 belongs to AS32934, nothing else does.
+function metaGeodbFixture() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'geodb-meta-'));
+  const ip = (a, b, c, d) => ((a << 24) | (b << 16) | (c << 8) | d) >>> 0;
+
+  // country.bin / asn.bin must exist for initGeoDb to consider itself loaded.
+  const country = Buffer.alloc(9);
+  country.writeUInt32BE(ip(57, 141, 0, 0), 0);
+  country.writeUInt32BE(ip(57, 141, 0, 255), 4);
+  country.writeUInt8(0, 8);
+  const asn = Buffer.alloc(10);
+  asn.writeUInt32BE(ip(57, 141, 0, 0), 0);
+  asn.writeUInt32BE(ip(57, 141, 0, 255), 4);
+  asn.writeUInt16BE(0xFFFF, 8);
+
+  const crawler = Buffer.alloc(10);
+  crawler.writeUInt32BE(ip(57, 141, 0, 0), 0);
+  crawler.writeUInt32BE(ip(57, 141, 0, 255), 4);
+  crawler.writeUInt16BE(0, 8);  // index into crawlerAsns -> 32934
+
+  fs.writeFileSync(path.join(dir, 'country.bin'), country);
+  fs.writeFileSync(path.join(dir, 'asn.bin'), asn);
+  fs.writeFileSync(path.join(dir, 'crawler-asn.bin'), crawler);
+  fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({
+    built: 'test', countries: ['US'], dcOrgs: [], crawlerAsns: [32934],
+  }));
+  return dir;
+}
+
+test('Meta crawler inside AS32934 is allowed (no PTR required)', async () => {
+  initGeoDb(metaGeodbFixture());
+  assert.strictEqual(crawlerAsn('57.141.0.43'), 32934);
+  // Would previously have been {fake:true} — no reverse lookup happens at all,
+  // proven by the beforeEach resolver that throws if consulted.
+  const fb = await checkWhitelistedBot(FB_UA, '57.141.0.43');
+  assert.deepStrictEqual(fb, { name: 'Facebook', allow: true });
+  const idx = await checkWhitelistedBot(META_INDEXER_UA, '57.141.0.44');
+  assert.deepStrictEqual(idx, { name: 'Meta (web indexer)', allow: true });
+});
+
+test('Meta UA from outside AS32934 is a fake crawler', async () => {
+  initGeoDb(metaGeodbFixture());
+  assert.strictEqual(crawlerAsn('203.0.113.9'), null);
+  const impostor = await checkWhitelistedBot(FB_UA, '203.0.113.9');
+  assert.deepStrictEqual(impostor, { name: 'Facebook', fake: true });
+});
+
+test('Meta stays rate-capped even when ASN-verified', async () => {
+  initGeoDb(metaGeodbFixture());
+  const ip = '57.141.0.99';
+  for (let i = 0; i < WHITELIST_BOT_CAP; i++) {
+    assert.deepStrictEqual(await checkWhitelistedBot(FB_UA, ip), { name: 'Facebook', allow: true });
+  }
+  assert.deepStrictEqual(await checkWhitelistedBot(FB_UA, ip), { name: 'Facebook', capped: true });
+});
+
+test('missing crawler-ASN data fails OPEN, never fake', async () => {
+  // A geodb built before crawler-asn.bin existed, or one where RIPEstat was
+  // down: we cannot prove an impostor, so honour the capped UA whitelist.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'geodb-nocrawler-'));
+  const country = Buffer.alloc(0);
+  fs.writeFileSync(path.join(dir, 'country.bin'), country);
+  fs.writeFileSync(path.join(dir, 'asn.bin'), Buffer.alloc(0));
+  fs.writeFileSync(path.join(dir, 'meta.json'),
+    JSON.stringify({ built: 'test', countries: [], dcOrgs: [] }));
+  assert.strictEqual(initGeoDb(dir), true);
+  assert.strictEqual(crawlerAsnDataLoaded(), false);
+
+  assert.deepStrictEqual(await checkWhitelistedBot(FB_UA, '203.0.113.9'),
+    { name: 'Facebook', allow: true });
+});
+
+test('IPv6 Meta client fails open (ranges are IPv4-only)', async () => {
+  initGeoDb(metaGeodbFixture());
+  assert.deepStrictEqual(await checkWhitelistedBot(FB_UA, '2a03:2880:f003::1'),
+    { name: 'Facebook', allow: true });
 });

@@ -12,6 +12,7 @@
 //   env GEODB_SRC_DIR=<dir>  read dbip-country-lite.csv.gz /
 //                            dbip-asn-lite.csv.gz from a local dir instead of
 //                            downloading (tests, offline builds)
+//   env SKIP_CRAWLER_ASN=1   skip the RIPEstat crawler-ASN fetch (offline builds)
 //
 // FAIL-OPEN CONTRACT: if no database can be fetched (network down, DB-IP
 // gone), this script writes an EMPTY meta.json and exits 0 — the image still
@@ -131,9 +132,64 @@ async function fetchDb(name) {
 function writeEmpty(reason) {
   writeFileSync(join(OUT_DIR, 'meta.json'), JSON.stringify({
     built: new Date().toISOString(), empty: true, reason, countries: [], dcOrgs: [],
+    crawlerAsns: [],
   }));
+  writeFileSync(join(OUT_DIR, 'crawler-asn.bin'), Buffer.alloc(0));
   console.error(`[geodb] WARNING: shipping EMPTY geodb (${reason}) — geo/ASN risk signals will be disabled`);
   process.exit(0);
+}
+
+// -----------------------------------------------------------------------------
+// Verified-crawler ASNs
+// -----------------------------------------------------------------------------
+// Some crawler operators do NOT publish reverse DNS for their fetchers, so the
+// forward-confirmed rDNS check server.js uses for Googlebot/Bingbot cannot work
+// for them. Meta is the case that bit us: 57.141.0.0-57.149.255.255 is FB-BLOCK
+// (Meta Platforms Ireland, RIPE) but the addresses have NO PTR record at all, so
+// every facebookexternalhit / meta-externalagent / meta-webindexer request was
+// classified `fake` and fell through to risk scoring — which challenged it. That
+// silently broke Facebook/Messenger/WhatsApp/Instagram link previews (1,508
+// facebookexternalhit hits blocked in 48h, 2026-08-03..05). Meta documents
+// verification by their published IP ranges / AS32934 — not by rDNS.
+//
+// So: compile the ASN's currently-announced IPv4 prefixes into a range file and
+// let server.js verify membership. Same fail-open philosophy as everything else
+// here — if RIPEstat is unreachable the file ships EMPTY and server.js honours
+// the UA-only whitelist (still rate-capped), because a broken link preview is
+// worse than briefly trusting a spoofable UA at 30 req/min.
+const CRAWLER_ASNS = [
+  { asn: 32934, name: 'Meta Platforms' },
+];
+
+async function fetchAsnPrefixes(asn) {
+  const url = `https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS${asn}`;
+  try {
+    const res = await fetch(url, { redirect: 'follow' });
+    if (!res.ok) {
+      console.log(`[geodb] AS${asn} -> HTTP ${res.status}`);
+      return null;
+    }
+    const body = await res.json();
+    if (body.status !== 'ok' || !body.data || !Array.isArray(body.data.prefixes)) {
+      console.log(`[geodb] AS${asn} -> unexpected payload`);
+      return null;
+    }
+    return body.data.prefixes.map(p => p.prefix).filter(p => p && !p.includes(':'));
+  } catch (err) {
+    console.log(`[geodb] AS${asn} failed: ${err.message}`);
+    return null;
+  }
+}
+
+// "1.2.3.0/24" -> [firstInt, lastInt]; null when malformed or a silly prefix
+// length (a /0..7 from a bad feed would whitelist a huge slice of the internet).
+function cidrToRange(cidr) {
+  const [addr, bitsRaw] = cidr.split('/');
+  const bits = parseInt(bitsRaw, 10);
+  const start = ipToInt(addr);
+  if (start === null || !Number.isInteger(bits) || bits < 8 || bits > 32) return null;
+  const size = 2 ** (32 - bits);
+  return [start, start + size - 1];
 }
 
 const countryCsv = await fetchDb('dbip-country-lite');
@@ -204,17 +260,57 @@ asnRecords.forEach(([start, end, idx], i) => {
   asnBuf.writeUInt16BE(idx, i * 10 + 8);
 });
 
+// --- crawler-asn.bin ---------------------------------------------------------
+// Same 10-byte record layout as asn.bin, but the u16 holds an index into
+// meta.crawlerAsns (the ASN NUMBER list), not an org-name table.
+const crawlerAsns = [];
+const crawlerRecords = [];
+if (process.env.SKIP_CRAWLER_ASN) {
+  console.log('[geodb] SKIP_CRAWLER_ASN set — crawler-asn.bin will be empty');
+} else {
+  for (const { asn, name } of CRAWLER_ASNS) {
+    const prefixes = await fetchAsnPrefixes(asn);
+    if (!prefixes || prefixes.length === 0) {
+      // Fail open for THIS asn: server.js falls back to the UA-only (capped)
+      // whitelist rather than treating the crawler as a fake.
+      console.error(`[geodb] WARNING: no prefixes for AS${asn} (${name}) — `
+        + 'its UA whitelist will be honoured uncorroborated (still rate-capped)');
+      continue;
+    }
+    const idx = crawlerAsns.push(asn) - 1;
+    let kept = 0;
+    for (const cidr of prefixes) {
+      const range = cidrToRange(cidr);
+      if (!range) continue;
+      crawlerRecords.push([range[0], range[1], idx]);
+      kept++;
+    }
+    console.log(`[geodb] AS${asn} (${name}): ${kept} IPv4 prefixes`);
+  }
+}
+crawlerRecords.sort((a, b) => a[0] - b[0]);
+const crawlerBuf = Buffer.alloc(crawlerRecords.length * 10);
+crawlerRecords.forEach(([start, end, idx], i) => {
+  crawlerBuf.writeUInt32BE(start, i * 10);
+  crawlerBuf.writeUInt32BE(end, i * 10 + 4);
+  crawlerBuf.writeUInt16BE(idx, i * 10 + 8);
+});
+
 // --- write -------------------------------------------------------------------
 writeFileSync(join(OUT_DIR, 'country.bin'), countryBuf);
 writeFileSync(join(OUT_DIR, 'asn.bin'), asnBuf);
+writeFileSync(join(OUT_DIR, 'crawler-asn.bin'), crawlerBuf);
 writeFileSync(join(OUT_DIR, 'meta.json'), JSON.stringify({
   built: new Date().toISOString(),
-  source: 'DB-IP lite (db-ip.com, CC BY 4.0)',
+  source: 'DB-IP lite (db-ip.com, CC BY 4.0); crawler ASNs via RIPEstat',
   countryRanges: countryRecords.length,
   asnRanges: asnRecords.length,
   dcRanges: dcRangeCount,
+  crawlerAsnRanges: crawlerRecords.length,
   countries,
   dcOrgs,
+  crawlerAsns,
 }));
 console.log(`[geodb] wrote ${countryRecords.length} country ranges, `
-  + `${asnRecords.length} ASN ranges (${dcRangeCount} datacenter, ${dcOrgs.length} orgs) to ${OUT_DIR}`);
+  + `${asnRecords.length} ASN ranges (${dcRangeCount} datacenter, ${dcOrgs.length} orgs), `
+  + `${crawlerRecords.length} crawler-ASN ranges (AS${crawlerAsns.join(', AS') || 'none'}) to ${OUT_DIR}`);

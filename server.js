@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const dns = require('dns');
+const readline = require('readline');
 
 // =============================================================================
 // CONFIGURATION
@@ -141,19 +142,31 @@ function isStaticAsset(requestPath) {
 //                  datacenter-ASN scoring usually catches it). DNS
 //                  timeout/SERVFAIL → fail OPEN (whitelist honored, uncached):
 //                  never 403 real Googlebot because a resolver hiccuped.
+//   asn: <n>     — forward verification by ASN membership instead of rDNS, for
+//                  operators who publish IP ranges but no PTR records (Meta).
+//                  Backed by geodb/crawler-asn.bin; a MISSING range file or an
+//                  IPv6 client yields no verdict and falls through to the
+//                  capped UA-only path — never to `fake`.
 //   capped: true — UA-only whitelist with a WHITELIST_BOT_CAP/min per-IP
 //                  budget (429 above it). For preview bots that fetch a page
 //                  per human share, the cap is unreachable; for a scraper
 //                  hiding behind "WhatsApp" it's a ceiling. meta-webindexer
-//                  sits here on purpose: verified via .fbsv.net but capped —
-//                  8k+ pages in 3 days is not link-preview behavior.
+//                  sits here on purpose: ASN-verified but capped — 8k+ pages
+//                  in 3 days is not link-preview behavior.
 //   (neither)    — legacy unlimited UA-only pass. Reserved for Stripe
 //                  webhooks: capping those risks dropped payment events, a
 //                  far worse failure than tolerating a spoofable UA that was
 //                  spoofable yesterday too.
 const RDNS_GOOGLE = ['.googlebot.com', '.google.com'];
 const RDNS_BING = ['.search.msn.com'];
-const RDNS_META = ['.fbsv.net'];
+
+// Meta is verified by ASN, not rDNS: their fetcher addresses have NO PTR record
+// at all (checked against 8.8.8.8, 1.1.1.1 and our own resolver), so the
+// forward-confirmed check below can only ever return 'fake' for them. It did —
+// 50 583 Meta requests were misclassified in 48h and 1 508 of those were
+// facebookexternalhit, i.e. broken Facebook/WhatsApp/Messenger link previews.
+// Meta documents verification against their published ranges / AS32934.
+const ASN_META = 32934;
 
 const WHITELISTED_BOTS = [
   // Google (https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers)
@@ -181,9 +194,9 @@ const WHITELISTED_BOTS = [
 
   // Social media previews (important for link sharing/SEO) — fetch one page
   // per human share; the per-IP cap never touches that, only impersonators.
-  { pattern: /facebookexternalhit/i, name: 'Facebook', rdns: RDNS_META, capped: true },
-  { pattern: /meta-externalagent/i, name: 'Meta (external agent)', rdns: RDNS_META, capped: true },
-  { pattern: /meta-webindexer/i, name: 'Meta (web indexer)', rdns: RDNS_META, capped: true },
+  { pattern: /facebookexternalhit/i, name: 'Facebook', asn: ASN_META, capped: true },
+  { pattern: /meta-externalagent/i, name: 'Meta (external agent)', asn: ASN_META, capped: true },
+  { pattern: /meta-webindexer/i, name: 'Meta (web indexer)', asn: ASN_META, capped: true },
   { pattern: /Twitterbot/i, name: 'Twitter/X', capped: true },
   { pattern: /LinkedInBot/i, name: 'LinkedIn', capped: true },
   { pattern: /WhatsApp/i, name: 'WhatsApp', capped: true },
@@ -290,6 +303,15 @@ async function checkWhitelistedBot(userAgent, ip) {
       const state = await verifyCrawlerRdns(ip, entry.rdns);
       if (state === 'fake') return { name: entry.name, fake: true };
       // 'ok' → verified; 'error' → fail open (uncached, retried next request)
+    }
+    if (entry.asn) {
+      // Only a LOADED range file can prove an impostor. With no data (missing
+      // file, RIPEstat down at build time, or an IPv6 client — the ranges are
+      // IPv4-only) we must not invent a verdict: fall through to the capped
+      // UA-only whitelist, which bounds the damage at WHITELIST_BOT_CAP/min.
+      if (crawlerAsnDataLoaded() && ipToInt(ip) !== 0 && crawlerAsn(ip) !== entry.asn) {
+        return { name: entry.name, fake: true };
+      }
     }
     if (entry.capped && isCrawlerCapped(entry.name, ip)) {
       return { name: entry.name, capped: true };
@@ -613,13 +635,18 @@ function isHTTP1Browser(userAgent, originalProtocol) {
 
 const GEODB_DIR = process.env.GEODB_DIR || path.join(__dirname, 'geodb');
 
-const geoDb = { countryBuf: null, asnBuf: null, countries: [], dcOrgs: [] };
+const geoDb = {
+  countryBuf: null, asnBuf: null, crawlerAsnBuf: null,
+  countries: [], dcOrgs: [], crawlerAsns: [],
+};
 
 function initGeoDb(dir) {
   geoDb.countryBuf = null;
   geoDb.asnBuf = null;
+  geoDb.crawlerAsnBuf = null;
   geoDb.countries = [];
   geoDb.dcOrgs = [];
+  geoDb.crawlerAsns = [];
   try {
     const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
     geoDb.countries = meta.countries || [];
@@ -628,13 +655,29 @@ function initGeoDb(dir) {
     geoDb.asnBuf = fs.readFileSync(path.join(dir, 'asn.bin'));
     console.log(`[GEODB] Loaded ${geoDb.countryBuf.length / 9} country ranges, `
       + `${geoDb.asnBuf.length / 10} ASN ranges (built ${meta.built || 'unknown'})`);
-    return true;
   } catch (err) {
     geoDb.countryBuf = null;
     geoDb.asnBuf = null;
     console.log(`[GEODB] Not available (${err.message}) — geo/ASN risk signals disabled`);
     return false;
   }
+
+  // Optional and independently fail-open: an image built before this file
+  // existed (or a build where RIPEstat was down) must still start, with the
+  // ASN-verified crawlers falling back to their capped UA-only whitelist.
+  try {
+    geoDb.crawlerAsns = JSON.parse(
+      fs.readFileSync(path.join(dir, 'meta.json'), 'utf8')).crawlerAsns || [];
+    geoDb.crawlerAsnBuf = fs.readFileSync(path.join(dir, 'crawler-asn.bin'));
+    console.log(`[GEODB] Loaded ${geoDb.crawlerAsnBuf.length / 10} crawler-ASN ranges `
+      + `(AS${geoDb.crawlerAsns.join(', AS') || 'none'})`);
+  } catch (err) {
+    geoDb.crawlerAsnBuf = null;
+    geoDb.crawlerAsns = [];
+    console.log(`[GEODB] Crawler-ASN ranges not available (${err.message}) — `
+      + 'ASN-verified crawlers fall back to capped UA-only whitelist');
+  }
+  return true;
 }
 
 // Binary search over sorted fixed-size records; returns record offset or -1.
@@ -677,6 +720,22 @@ function asnDatacenterOrg(ip) {
   return geoDb.dcOrgs[orgIdx] || null;
 }
 
+// Verified-crawler ASN membership (see build-geodb.mjs → CRAWLER_ASNS).
+// Returns the ASN number announcing this IPv4 address, or null.
+//   null + loaded buffer  => the IP is genuinely NOT in the ASN (impostor)
+//   null + absent buffer  => we simply do not know; callers must fail OPEN
+function crawlerAsn(ip) {
+  const ipInt = ipToInt(ip);
+  if (ipInt === 0) return null;
+  const off = geoRangeLookup(geoDb.crawlerAsnBuf, 10, ipInt);
+  if (off === -1) return null;
+  return geoDb.crawlerAsns[geoDb.crawlerAsnBuf.readUInt16BE(off + 8)] ?? null;
+}
+
+function crawlerAsnDataLoaded() {
+  return Boolean(geoDb.crawlerAsnBuf && geoDb.crawlerAsnBuf.length > 0);
+}
+
 // =============================================================================
 // RISK SCORING (the "intelligent" ladder — D50)
 //
@@ -707,9 +766,21 @@ const SCORE_WEIGHTS = {
   platform_mismatch: 40,       // sec-ch-ua-platform contradicts the UA's OS
   no_accept_language: 20,      // browser-like UA without Accept-Language
   locale_lang_mismatch: 15,    // reads /ja/ but Accept-Language has no ja
-  cookieless_same_origin: 25,  // claims in-site navigation with an empty cookie jar
   cookieless_deep_direct: 10,  // cookieless, referer-less entry straight to deep content
 };
+
+// REMOVED 2026-08-05: `cookieless_same_origin` (was 25). Measured against 48h of
+// live enforcement it was INVERTED — it fired on 33.9% of challenges that a
+// human then solved, but only 0.5% of all other challenges, i.e. it was ~68x
+// more likely on a human than on a bot. The reason is structural: it required
+// `sec-fetch-site: same-origin` WITHOUT a cookie, which is what a real browser
+// sends on a first in-site navigation (new visitor, private window, or cookies
+// blocked) — while the headless fleets mostly send no Sec-Fetch-* at all and so
+// trip `no_sec_fetch` instead. Replaying every scored request without it:
+// 104 of 391 human challenge events relieved (27%) for 1 446 of 368 351
+// non-human ones (0.39%). Do not reintroduce it as a negative "human credit"
+// either — `sec-fetch-site` is trivially forgeable, so that would hand every
+// scraper a free discount.
 
 // UA OS family <-> sec-ch-ua-platform values (both sides normalized).
 function uaOsFamily(ua) {
@@ -809,9 +880,6 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m) {
 
   // --- Cookie persistence (the "new GA user per hit" signature) -------------
   const hasCookies = Boolean(headers['cookie']);
-  if (!hasCookies && headers['sec-fetch-site'] === 'same-origin') {
-    components.cookieless_same_origin = SCORE_WEIGHTS.cookieless_same_origin;
-  }
   if (!hasCookies && !headers['referer']
     && requestPath.split('?')[0].split('/').filter(Boolean).length >= 2) {
     components.cookieless_deep_direct = SCORE_WEIGHTS.cookieless_deep_direct;
@@ -863,7 +931,21 @@ function logBlocked(type, ip, userAgent, reason, requestPath, extra) {
 // DAILY SUMMARY GENERATION
 // =============================================================================
 
-function generateDailySummary() {
+// Reason strings embed per-request numbers ("Risk score 117 (base 50 x pressure
+// 2.33)", "Tencent Cloud botnet range (43.172.0.0/15)"). Keying the histogram on
+// the raw string therefore produced ONE BUCKET PER REQUEST — that is what made
+// summary-2026-08-02.txt 425 KB instead of ~1.5 KB. Collapse every run of digits
+// so the cardinality is bounded by the number of distinct rule texts.
+function summaryReasonKey(reason) {
+  return String(reason || '(none)').replace(/\d+/g, 'N').slice(0, 120);
+}
+
+// Hard ceiling on the per-IP table. 145k unique IPs/day is normal under the
+// swarm; the cap only bites in an extreme and we say so in the output rather
+// than silently truncating.
+const SUMMARY_MAX_IPS = 250000;
+
+async function generateDailySummary() {
   const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
   const logFile = path.join(LOG_DIR, `blocked-${yesterday}.log`);
 
@@ -873,37 +955,61 @@ function generateDailySummary() {
   }
 
   try {
-    const content = fs.readFileSync(logFile, 'utf8');
-    const lines = content.trim().split('\n').filter(Boolean);
+    // STREAMED, never readFileSync: with enforcement on, a day's log is
+    // 120-170 MB, and slurping it (Buffer + UTF-8 string + split array) blew
+    // past the container's memory limit. The process was OOM-killed at 00:05
+    // UTC on 2026-08-04 and 2026-08-05, losing every in-memory counter
+    // (permabans, rate limits, rDNS cache) and producing no summary at all.
+    const stats = { total: 0, malformed: 0, byType: {}, byReason: {} };
+    const topIPs = new Map();
+    let ipsPruned = false;
 
-    const stats = { total: lines.length, byType: {}, byReason: {}, topIPs: {} };
+    const rl = readline.createInterface({
+      input: fs.createReadStream(logFile, { encoding: 'utf8' }),
+      crlfDelay: Infinity,
+    });
 
-    for (const line of lines) {
+    for await (const line of rl) {
+      if (!line) continue;
+      let entry;
       try {
-        const entry = JSON.parse(line);
-        stats.byType[entry.type] = (stats.byType[entry.type] || 0) + 1;
-        stats.byReason[entry.reason] = (stats.byReason[entry.reason] || 0) + 1;
-        stats.topIPs[entry.ip] = (stats.topIPs[entry.ip] || 0) + 1;
+        entry = JSON.parse(line);
       } catch (e) {
-        // Skip malformed lines
+        stats.malformed++;
+        continue;
+      }
+      stats.total++;
+      stats.byType[entry.type] = (stats.byType[entry.type] || 0) + 1;
+      const rk = summaryReasonKey(entry.reason);
+      stats.byReason[rk] = (stats.byReason[rk] || 0) + 1;
+      const ip = entry.ip || '(none)';
+      topIPs.set(ip, (topIPs.get(ip) || 0) + 1);
+      if (topIPs.size > SUMMARY_MAX_IPS) {
+        // Drop the singletons: an IP seen once cannot reach a top-10 whose
+        // entries are in the hundreds. Bounds memory without a second pass.
+        for (const [k, v] of topIPs) if (v === 1) topIPs.delete(k);
+        ipsPruned = true;
       }
     }
 
-    const topIPs = Object.entries(stats.topIPs).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const top = [...topIPs.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+    const byCount = obj => Object.entries(obj).sort((a, b) => b[1] - a[1]);
 
     const summary = `Daily Block Summary: ${yesterday}
 ================================
 
-Total Blocked Requests: ${stats.total}
+Total Blocked Requests: ${stats.total}${stats.malformed ? `
+Malformed log lines skipped: ${stats.malformed}` : ''}
 
 By Type:
-${Object.entries(stats.byType).map(([k, v]) => `  ${k}: ${v}`).join('\n')}
+${byCount(stats.byType).map(([k, v]) => `  ${k}: ${v}`).join('\n')}
 
-By Reason:
-${Object.entries(stats.byReason).map(([k, v]) => `  ${k}: ${v}`).join('\n')}
+By Reason (digits collapsed to N):
+${byCount(stats.byReason).slice(0, 40).map(([k, v]) => `  ${k}: ${v}`).join('\n')}
 
-Top 10 Blocked IPs:
-${topIPs.map(([ip, count]) => `  ${ip}: ${count}`).join('\n')}
+Top 10 Blocked IPs:${ipsPruned ? '  (single-hit IPs pruned above '
+  + `${SUMMARY_MAX_IPS} distinct)` : ''}
+${top.map(([ip, count]) => `  ${ip}: ${count}`).join('\n')}
 `;
 
     fs.writeFileSync(path.join(LOG_DIR, `summary-${yesterday}.txt`), summary);
@@ -921,9 +1027,14 @@ function scheduleNextSummary() {
 
   const msUntilSummary = tomorrow - now;
 
+  // generateDailySummary is async now; an unhandled rejection here would take
+  // the whole process down on Node >=15, which is exactly the daily outage this
+  // change exists to remove. Swallow at the boundary — it already logs.
+  const run = () => { generateDailySummary().catch(err => console.error(`[SUMMARY] ${err.message}`)); };
+
   setTimeout(() => {
-    generateDailySummary();
-    setInterval(generateDailySummary, 24 * 60 * 60 * 1000);
+    run();
+    setInterval(run, 24 * 60 * 60 * 1000);
   }, msUntilSummary);
 
   console.log(`[SUMMARY] Scheduled in ${Math.round(msUntilSummary / 1000 / 60)} minutes`);
@@ -2107,6 +2218,11 @@ module.exports = {
   initGeoDb,
   geoCountry,
   asnDatacenterOrg,
+  crawlerAsn,
+  crawlerAsnDataLoaded,
+  // Daily summary
+  generateDailySummary,
+  summaryReasonKey,
   // Visitor-facing pages
   renderPage,
   detectPageLocale,

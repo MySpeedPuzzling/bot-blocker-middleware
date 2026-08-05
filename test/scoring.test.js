@@ -17,7 +17,7 @@ process.env.SURGE_EXTRA_SCORE = '20';
 process.env.HIGH_RISK_COUNTRIES = 'CN,HK,SG,VN,ID';
 
 const {
-  computeRiskScore, isScorableRequest, uaOsFamily, SCORE_WEIGHTS,
+  computeRiskScore, isScorableRequest, uaOsFamily, SCORE_WEIGHTS, SCORE_THRESHOLD,
   initGeoDb, geoCountry, asnDatacenterOrg,
 } = require('../server.js');
 
@@ -161,11 +161,20 @@ test('locale path with non-overlapping Accept-Language is flagged', () => {
   assert.strictEqual(ok.components.locale_lang_mismatch, undefined);
 });
 
-test('cookieless claimed-internal navigation is the GA-pollution signature', () => {
+// Regression guard for the 2026-08-05 removal. A cookieless same-origin
+// navigation is what a FIRST-TIME HUMAN sends (new visitor / private window /
+// cookies blocked): measured over 48h of enforcement it appeared on 33.9% of
+// challenges a human then solved versus 0.5% of all others. It must never
+// again contribute risk on its own — and never a negative "credit" either,
+// since sec-fetch-site is trivially forgeable.
+test('cookieless same-origin navigation contributes NO risk (removed signal)', () => {
   const headers = coherentHeaders({ 'sec-fetch-site': 'same-origin' });
   delete headers['cookie'];
   const risk = computeRiskScore('203.0.113.10', CHROME_UA, '/puzzle/abc', headers, 10);
-  assert.strictEqual(risk.components.cookieless_same_origin, SCORE_WEIGHTS.cookieless_same_origin);
+  assert.strictEqual(risk.components.cookieless_same_origin, undefined);
+  assert.strictEqual(SCORE_WEIGHTS.cookieless_same_origin, undefined);
+  // a coherent first-time browser on a residential IP stays under the threshold
+  assert.ok(risk.score < SCORE_THRESHOLD, `scored ${risk.score}, expected < ${SCORE_THRESHOLD}`);
 });
 
 test('cookieless referer-less deep entry adds a weak signal', () => {

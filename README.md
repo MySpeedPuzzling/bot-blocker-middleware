@@ -153,18 +153,30 @@ executing Google Analytics from worldwide consumer ISPs.
 
 ## Verified Crawler Whitelist
 
-`Googlebot`/`Bingbot`/`SeznamBot`/`YandexBot`/`Applebot` UAs are verified
-with forward-confirmed rDNS (cached 48 h; DNS trouble fails **open**,
-definitive mismatch falls through to the normal pipeline as a fake). UA-only
-entries (link-preview bots, `meta-webindexer`) pass under a
-`WHITELIST_BOT_CAP`/min per-IP budget. Stripe stays uncapped — webhook
+Crawlers are verified two ways, because not every operator publishes the same
+proof:
+
+- **rDNS** — `Googlebot`/`Bingbot`/`SeznamBot`/`YandexBot`/`Applebot`, forward
+  confirmed and cached 48 h. DNS trouble fails **open**; a definitive mismatch
+  falls through to the normal pipeline as a fake.
+- **ASN** — `facebookexternalhit`/`meta-externalagent`/`meta-webindexer`, by
+  membership of AS32934 (`geodb/crawler-asn.bin`). Meta's fetchers have **no
+  PTR records at all**, so the rDNS check could only ever call them fake — it
+  did, for 50 583 requests in 48 h, which silently broke Facebook/WhatsApp
+  link previews. Missing range data or an IPv6 client fails **open** to the
+  capped UA-only path, never to fake.
+
+UA-only entries (other link-preview bots) and both verified Meta paths pass
+under a `WHITELIST_BOT_CAP`/min per-IP budget. Stripe stays uncapped — webhook
 delivery must never break.
 
 ## GeoDB (DB-IP)
 
-`scripts/build-geodb.mjs` compiles the free DB-IP lite databases into binary
-range files at image build; a monthly scheduled CI rebuild keeps them fresh.
-Missing files degrade gracefully (geo/ASN signals score 0).
+`scripts/build-geodb.mjs` compiles the free DB-IP lite databases plus the
+verified-crawler ASN prefixes (RIPEstat) into binary range files at image
+build; a monthly scheduled CI rebuild keeps them fresh. Missing files degrade
+gracefully (geo/ASN signals score 0, ASN-verified crawlers fall back to
+capped).
 *IP geolocation by [DB-IP](https://db-ip.com) (CC BY 4.0).*
 
 ## Adding New Bot Patterns
