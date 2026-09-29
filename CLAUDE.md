@@ -25,6 +25,7 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 **Request flow:**
 1. Static asset check → bypass rate limiting for `/build/`, `/css/`, `/img/`, etc.
 2. Crawler whitelist, TIERED (2026-08): rDNS-verified (Google/Bing/Seznam/Yandex/Apple — forward-confirmed PTR, cached, fail-OPEN on DNS trouble) → 200 unlimited; UA-only entries (preview bots, meta-webindexer) → 200 under a per-IP cap, 429 above; rDNS-refuted impersonators → logged `fake_crawler` and FALL THROUGH to the full pipeline.
+2a. **Google published fetcher ranges** (2026-09-29): IP in Google's four published lists (common-crawlers, special-crawlers, user-triggered-fetchers, user-triggered-fetchers-google) → 200 under the per-IP `WHITELIST_BOT_CAP`, whatever the UA (OAuth brand verification sends just `Google`). Baked into `geodb/google-ranges.json` at build, refreshed at runtime every `GOOGLE_RANGES_REFRESH_HOURS` (24; 0 = off), per-list last-good kept on failure.
 2b. Challenge-solve callback (`?__bb_token=`), then **trusted-human cookie** (`__bb_trust`, minted by the app for logged-in users) → immediate 200, bypasses EVERYTHING below including permabans and rate limits (competition WiFi: 1000+ users, one IP). Not IP-bound; a golden-vector test pins the wire format against the app repo.
 3. Permanent ban check → immediate 403 for banned IPs
 4. Blocked path check → immediate 403 for WordPress exploits, `.env`, `.git` access
@@ -39,7 +40,7 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 13. Locale switching check → 403 + permaban if 4 locales with 3+ hits in 60s
 14. Page scraping check → 429/403 for rapid puzzle/profile page scraping (IP+UA keyed)
 15. Rate limiting → 429 if IP+UA exceeds `RATE_LIMIT` requests per `RATE_WINDOW`
-16. **Risk-scoring ladder** (2026-08, D50 in lily.srv) → for anonymous HTML GETs only: weak signals (datacenter ASN via baked-in DB-IP GeoDB, audience-prior country, impossible-Chromium header sets, Accept-Language/locale mismatch, cookie-persistence anomalies) × global crawl-pressure multiplier; score ≥ `SCORE_THRESHOLD` serves the Turnstile challenge — NEVER a hard block, honoring the lesson of the two removed aggregate rules above. `SCORING_MODE=log` (default) is shadow-only; flip to `challenge` only after shadow logs confirm the threshold on real traffic.
+16. **Risk-scoring ladder** (skipped for `SCORING_EXEMPT_PATHS`: home + privacy/terms/data-deletion in all 6 locales — reviewers' pages; deterministic rules still apply) (2026-08, D50 in lily.srv) → for anonymous HTML GETs only: weak signals (datacenter ASN via baked-in DB-IP GeoDB, audience-prior country, impossible-Chromium header sets, Accept-Language/locale mismatch, cookie-persistence anomalies) × global crawl-pressure multiplier; score ≥ `SCORE_THRESHOLD` serves the Turnstile challenge — NEVER a hard block, honoring the lesson of the two removed aggregate rules above. `SCORING_MODE=log` (default) is shadow-only; flip to `challenge` only after shadow logs confirm the threshold on real traffic.
 17. Allow → 200 OK
 
 **Key data structures in `server.js`:**

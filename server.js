@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const dns = require('dns');
+const net = require('net');
 const readline = require('readline');
 
 // =============================================================================
@@ -319,6 +320,169 @@ async function checkWhitelistedBot(userAgent, ip) {
     return { name: entry.name, allow: true };
   }
   return null;
+}
+
+// =============================================================================
+// GOOGLE PUBLISHED FETCHER RANGES (IP-verified, UA-independent)
+//
+// Google's user-triggered fetchers do not say "Googlebot" and often say almost
+// nothing: the OAuth brand-verification fetcher sends the bare UA "Google",
+// Read Aloud sends a mobile-Chrome UA, Lens sends "Google-Lens", Docs/Gmail
+// link previews send a desktop-Chrome UA with ",gzip(gfe)". None matched the
+// UA whitelist, all come from a Google ASN (dc_asn +40) without a browser
+// header set, so the risk ladder challenged every one of them — on 2026-09-29
+// that made Google's OAuth brand verification see the challenge page instead
+// of the home page and privacy policy, and reject the app ("home page behind a
+// login page", "privacy policy does not have sufficient content").
+//
+// Google documents verification for these by its published IP lists, not by
+// UA. Addresses cannot be spoofed here (Traefik scrubs X-Forwarded-For), and
+// the lists are small dedicated /27s, not general Google Cloud space — a GCP
+// VM does NOT land in them. Membership still gets a per-IP cap
+// (WHITELIST_BOT_CAP/min): user-triggered fetchers fetch on behalf of people
+// and should never approach it.
+//
+// Data: baked at image build (scripts/build-geodb.mjs → geodb/google-ranges.json)
+// and refreshed at runtime every GOOGLE_RANGES_REFRESH_HOURS (default 24, 0 =
+// off). Everything fails OPEN in the sense of "no extra privileges": no data
+// just means these requests go through the normal pipeline as before.
+// =============================================================================
+
+const GOOGLE_RANGE_LISTS = {
+  'common-crawlers': 'https://developers.google.com/static/crawling/ipranges/common-crawlers.json',
+  'special-crawlers': 'https://developers.google.com/static/crawling/ipranges/special-crawlers.json',
+  'user-triggered-fetchers': 'https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers.json',
+  'user-triggered-fetchers-google': 'https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json',
+};
+const GOOGLE_RANGES_REFRESH_HOURS = process.env.GOOGLE_RANGES_REFRESH_HOURS === undefined
+  ? 24 : parseFloat(process.env.GOOGLE_RANGES_REFRESH_HOURS) || 0;
+
+// list name -> array of CIDR strings; the BlockList is rebuilt from it.
+const googleRanges = { lists: {}, blockList: new net.BlockList(), count: 0, source: 'none' };
+
+// Extracts CIDRs from one of Google's JSON documents ({ prefixes: [{ ipv4Prefix
+// | ipv6Prefix }] }). Returns null on anything unexpected.
+function parseGoogleRangeDocument(doc) {
+  if (!doc || !Array.isArray(doc.prefixes)) return null;
+  const cidrs = [];
+  for (const p of doc.prefixes) {
+    const cidr = p && (p.ipv4Prefix || p.ipv6Prefix);
+    if (typeof cidr === 'string' && /^[0-9a-fA-F.:]+\/\d{1,3}$/.test(cidr)) cidrs.push(cidr);
+  }
+  return cidrs;
+}
+
+function rebuildGoogleBlockList() {
+  const bl = new net.BlockList();
+  let count = 0;
+  for (const cidrs of Object.values(googleRanges.lists)) {
+    for (const cidr of cidrs) {
+      const [addr, bits] = cidr.split('/');
+      const type = net.isIPv6(addr) ? 'ipv6' : (net.isIPv4(addr) ? 'ipv4' : null);
+      if (!type) continue;
+      try {
+        bl.addSubnet(addr, parseInt(bits, 10), type);
+        count++;
+      } catch { /* malformed prefix — skip it, keep the rest */ }
+    }
+  }
+  googleRanges.blockList = bl;
+  googleRanges.count = count;
+}
+
+// lists: { name: [cidr, ...] } — merges over what is loaded, so a list that
+// failed to refresh keeps its previous (baked or last-good) contents.
+function setGoogleRanges(lists, source) {
+  let changed = false;
+  for (const [name, cidrs] of Object.entries(lists || {})) {
+    if (Array.isArray(cidrs) && cidrs.length > 0) {
+      googleRanges.lists[name] = cidrs;
+      changed = true;
+    }
+  }
+  if (changed) {
+    rebuildGoogleBlockList();
+    googleRanges.source = source;
+  }
+  return changed;
+}
+
+function loadGoogleRanges(dir) {
+  googleRanges.lists = {};
+  rebuildGoogleBlockList();
+  googleRanges.source = 'none';
+  try {
+    const baked = JSON.parse(fs.readFileSync(path.join(dir, 'google-ranges.json'), 'utf8'));
+    setGoogleRanges(baked.lists, `baked ${baked.built || 'unknown'}`);
+    console.log(`[GOOGLE] Loaded ${googleRanges.count} published fetcher prefixes (${googleRanges.source})`);
+  } catch (err) {
+    console.log(`[GOOGLE] No baked fetcher ranges (${err.message}) — waiting for runtime refresh`);
+  }
+}
+
+async function refreshGoogleRanges(fetchFn = fetch) {
+  const fresh = {};
+  await Promise.all(Object.entries(GOOGLE_RANGE_LISTS).map(async ([name, url]) => {
+    try {
+      const res = await fetchFn(url, { redirect: 'follow', signal: AbortSignal.timeout(10000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const cidrs = parseGoogleRangeDocument(await res.json());
+      if (!cidrs || cidrs.length === 0) throw new Error('no prefixes');
+      fresh[name] = cidrs;
+    } catch (err) {
+      console.log(`[GOOGLE] refresh of ${name} failed (${err.message}) — keeping previous data`);
+    }
+  }));
+  if (setGoogleRanges(fresh, `refreshed ${new Date().toISOString()}`)) {
+    console.log(`[GOOGLE] ${googleRanges.count} published fetcher prefixes after refresh`);
+  }
+}
+
+function normalizeClientIp(ip) {
+  if (typeof ip !== 'string') return '';
+  return ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+}
+
+function isGooglePublishedIp(ip) {
+  if (googleRanges.count === 0) return false;
+  const addr = normalizeClientIp(ip);
+  const type = net.isIPv4(addr) ? 'ipv4' : (net.isIPv6(addr) ? 'ipv6' : null);
+  if (!type) return false;
+  return googleRanges.blockList.check(addr, type);
+}
+
+// =============================================================================
+// RISK-LADDER EXEMPT PATHS
+//
+// The pages app-store / OAuth reviewers (Google, Meta, Apple) and their
+// fetchers open to judge the app: home page, privacy policy, terms, data
+// deletion — in every locale. They are cheap, contain nothing worth scraping,
+// and a challenge there fails a brand review. Exempt from the heuristic risk
+// ladder ONLY: deterministic rules (named bad bots, exploit paths, permabans,
+// rate limits) still apply. Keep in sync with the app's routes
+// (HomepageController, PrivacyPolicyController, TermsOfServiceController,
+// DataDeletionController).
+// =============================================================================
+
+const SCORING_EXEMPT_PATHS = new Set([
+  // homepage
+  '/', '/cs', '/en', '/es', '/ja', '/fr', '/de',
+  // privacy_policy
+  '/zasady-ochrany-osobnich-udaju', '/en/privacy-policy', '/es/politica-privacidad',
+  '/ja/プライバシー', '/fr/politique-confidentialite', '/de/datenschutz',
+  // terms_of_service
+  '/obchodni-podminky', '/en/terms-of-service', '/es/terminos-servicio',
+  '/ja/利用規約', '/fr/conditions-service', '/de/nutzungsbedingungen',
+  // data_deletion
+  '/smazani-udaju', '/en/data-deletion', '/es/eliminacion-datos',
+  '/ja/データ削除', '/fr/suppression-donnees', '/de/datenloeschung',
+]);
+
+function isScoringExemptPath(requestPath) {
+  let p = String(requestPath || '/').split('?')[0].split('#')[0];
+  try { p = decodeURIComponent(p); } catch { /* keep raw */ }
+  if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+  return SCORING_EXEMPT_PATHS.has(p);
 }
 
 // =============================================================================
@@ -1866,12 +2030,32 @@ async function handleRequest(req, res) {
   // impersonators ("Googlebot" from a Hetzner VM) fall through to the normal
   // pipeline below — no privileges, no instant block.
   const whitelisted = await checkWhitelistedBot(userAgent, ip);
-  if (whitelisted) {
-    if (whitelisted.allow) {
-      res.writeHead(200);
-      res.end('OK');
+  if (whitelisted && whitelisted.allow) {
+    res.writeHead(200);
+    res.end('OK');
+    return;
+  }
+
+  // Google's published crawler/fetcher ranges — verified by IP, whatever the
+  // UA says (OAuth brand verification sends just "Google"). Capped per IP.
+  if (isGooglePublishedIp(ip)) {
+    if (isCrawlerCapped('Google (published range)', ip)) {
+      logBlocked('crawler_capped', ip, userAgent,
+        `Google (published range) over ${WHITELIST_BOT_CAP}/min per-IP crawler cap`, requestPath);
+      res.writeHead(429, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Retry-After': '60',
+        'X-Blocked-Reason': 'crawler_cap',
+      });
+      res.end(renderPage('ratelimit', { locale, ip }));
       return;
     }
+    res.writeHead(200);
+    res.end('OK');
+    return;
+  }
+
+  if (whitelisted) {
     if (whitelisted.capped) {
       logBlocked('crawler_capped', ip, userAgent,
         `${whitelisted.name} over ${WHITELIST_BOT_CAP}/min per-IP crawler cap`, requestPath);
@@ -2133,7 +2317,8 @@ async function handleRequest(req, res) {
   // the Turnstile challenge (managed mode: invisible to genuine browsers).
   // Pass-cookie holders already proved humanity — never re-scored within the
   // cookie's lifetime. In 'log' (shadow) mode nothing is ever acted on.
-  if (SCORING_MODE !== 'off' && !hasPass && isScorableRequest(req.headers, requestPath)) {
+  if (SCORING_MODE !== 'off' && !hasPass && isScorableRequest(req.headers, requestPath)
+      && !isScoringExemptPath(requestPath)) {
     const rate5m = surgeTick();
     const risk = computeRiskScore(ip, userAgent, requestPath, req.headers, rate5m);
     if (risk.score >= SCORE_THRESHOLD) {
@@ -2169,6 +2354,12 @@ if (require.main === module) {
 ensureLogDir();
 loadBannedIPs();
 initGeoDb(GEODB_DIR);
+loadGoogleRanges(GEODB_DIR);
+if (GOOGLE_RANGES_REFRESH_HOURS > 0) {
+  refreshGoogleRanges().catch(() => {});
+  setInterval(() => { refreshGoogleRanges().catch(() => {}); },
+    GOOGLE_RANGES_REFRESH_HOURS * 3600 * 1000).unref();
+}
 
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
@@ -2233,4 +2424,11 @@ module.exports = {
   _setDnsForTests,
   isCrawlerCapped,
   WHITELIST_BOT_CAP,
+  // Google published fetcher ranges + ladder-exempt paths
+  parseGoogleRangeDocument,
+  setGoogleRanges,
+  loadGoogleRanges,
+  refreshGoogleRanges,
+  isGooglePublishedIp,
+  isScoringExemptPath,
 };

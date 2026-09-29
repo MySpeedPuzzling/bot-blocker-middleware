@@ -81,6 +81,7 @@ labels:
 | `SURGE_EXTRA_SCORE` | `20` | Extra base score for locale+cookieless requests while pressure > 2× |
 | `WHITELIST_BOT_CAP` | `30` | Per-IP req/min cap for UA-only whitelisted crawlers |
 | `RDNS_TIMEOUT_MS` | `1500` | Timeout per rDNS lookup step (fail-open on expiry) |
+| `GOOGLE_RANGES_REFRESH_HOURS` | `24` | Runtime refresh of Google's published crawler/fetcher IP lists (0 = baked copy only) |
 | `GEODB_DIR` | `./geodb` | Directory with the DB-IP binary range files |
 
 ## Human-Recovery Challenge (Cloudflare Turnstile)

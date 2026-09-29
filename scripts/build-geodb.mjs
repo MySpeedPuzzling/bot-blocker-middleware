@@ -31,6 +31,43 @@ if (!OUT_DIR) {
 }
 mkdirSync(OUT_DIR, { recursive: true });
 
+// -----------------------------------------------------------------------------
+// Google published crawler/fetcher IP lists → google-ranges.json
+// -----------------------------------------------------------------------------
+// Baked copy of the four lists server.js verifies Google fetchers against (it
+// also refreshes them at runtime; this copy covers the first minutes after
+// start and any period Google's site is unreachable). Written FIRST and
+// independently, so the DB-IP fail-open exit below never skips it. A list that
+// cannot be fetched is simply absent; an entirely failed fetch writes no file.
+const GOOGLE_RANGE_LISTS = {
+  'common-crawlers': 'https://developers.google.com/static/crawling/ipranges/common-crawlers.json',
+  'special-crawlers': 'https://developers.google.com/static/crawling/ipranges/special-crawlers.json',
+  'user-triggered-fetchers': 'https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers.json',
+  'user-triggered-fetchers-google': 'https://developers.google.com/static/crawling/ipranges/user-triggered-fetchers-google.json',
+};
+if (process.env.SKIP_GOOGLE_RANGES) {
+  console.log('[geodb] SKIP_GOOGLE_RANGES set — no google-ranges.json');
+} else {
+  const lists = {};
+  for (const [name, url] of Object.entries(GOOGLE_RANGE_LISTS)) {
+    try {
+      const res = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const body = await res.json();
+      const cidrs = (body.prefixes || []).map(p => p.ipv4Prefix || p.ipv6Prefix).filter(Boolean);
+      if (cidrs.length === 0) throw new Error('no prefixes');
+      lists[name] = cidrs;
+      console.log(`[geodb] Google ${name}: ${cidrs.length} prefixes`);
+    } catch (err) {
+      console.error(`[geodb] WARNING: Google ${name} failed (${err.message}) — runtime refresh must supply it`);
+    }
+  }
+  if (Object.keys(lists).length > 0) {
+    writeFileSync(join(OUT_DIR, 'google-ranges.json'),
+      JSON.stringify({ built: new Date().toISOString(), lists }));
+  }
+}
+
 // Org-name keywords that classify an ASN as hosting/datacenter. Substring
 // match on the lowercased org. Deliberately broad — the signal only ADDS
 // risk score toward a solvable challenge, never a hard block, so a stray
