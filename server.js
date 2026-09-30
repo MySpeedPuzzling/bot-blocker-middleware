@@ -109,6 +109,11 @@ const STATIC_ASSET_PATTERNS = [
   /^\/manifest\.json$/i,
   /^\/robots\.txt$/i,
   /^\/security\.txt$/i,
+  // Microsoft's publisher-domain verification file (Sign in with Microsoft
+  // app registration). Microsoft's verifier is a server-side fetch whose UA
+  // is undocumented (a bare HTTP client may send none -> the empty-UA rule)
+  // and comes from Azure ranges - it must never meet a block or challenge.
+  /^\/\.well-known\/microsoft-identity-association\.json$/i,
   /^\/service-worker\.js$/i,
   /^\/site\.webmanifest$/i,
   /^\/apple/i,
