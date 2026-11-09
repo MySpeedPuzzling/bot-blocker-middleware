@@ -24,12 +24,12 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 
 **Request flow:**
 1. Static asset check → bypass rate limiting for `/build/`, `/css/`, `/img/`, etc.
-2. Crawler whitelist, TIERED (2026-08): rDNS-verified (Google/Bing/Seznam/Yandex/Apple — forward-confirmed PTR, cached, fail-OPEN on DNS trouble) → 200 unlimited; UA-only entries (preview bots, meta-webindexer) → 200 under a per-IP cap, 429 above; rDNS-refuted impersonators → logged `fake_crawler` and FALL THROUGH to the full pipeline.
+2. Crawler whitelist, TIERED (2026-08): rDNS-verified (Google/Bing/Seznam/Yandex/Apple — forward-confirmed PTR, cached, fail-OPEN on DNS trouble) → 200 unlimited; UA-only entries (preview bots; Meta = `facebookexternalhit` only) → 200 under a per-IP cap, 429 above; rDNS-refuted impersonators → logged `fake_crawler` and FALL THROUGH to the full pipeline.
 2a. **Google published fetcher ranges** (2026-09-29): IP in Google's four published lists (common-crawlers, special-crawlers, user-triggered-fetchers, user-triggered-fetchers-google) → 200 under the per-IP `WHITELIST_BOT_CAP`, whatever the UA (OAuth brand verification sends just `Google`). Baked into `geodb/google-ranges.json` at build, refreshed at runtime every `GOOGLE_RANGES_REFRESH_HOURS` (24; 0 = off), per-list last-good kept on failure.
 2b. Challenge-solve callback (`?__bb_token=`), then **trusted-human cookie** (`__bb_trust`, minted by the app for logged-in users) → immediate 200, bypasses EVERYTHING below including permabans and rate limits (competition WiFi: 1000+ users, one IP). Not IP-bound; a golden-vector test pins the wire format against the app repo.
 3. Permanent ban check → immediate 403 for banned IPs
 4. Blocked path check → immediate 403 for WordPress exploits, `.env`, `.git` access
-5. Bot detection → 403 for known bad user agents (SEO bots, AI crawlers, impossible browser combos)
+5. Bot detection → 403 for known bad user agents (SEO bots, AI crawlers incl. `meta-webindexer`/`meta-externalagent`/`ShapBot` since 2026-11-09, impossible browser combos). Never block `facebookexternalhit` — it renders Facebook previews of shared results
 6. CIDR subnet check → 403 for known malicious IP ranges (43.104.33.0/24, 43.173.168.0/21)
 7. Chinese botnet check → 403 for 43.x IPs + Windows 10 + Chrome (any version)
 8. Fake iOS bot check → 403 for 43.x IPs with iPhone OS 13_2_3

@@ -73,7 +73,7 @@ const SURGE_BASELINE_5M = parseInt(process.env.SURGE_BASELINE_5M, 10) || 300;
 // — the exact surface the 2026-07 residential swarm crawled.
 const SURGE_EXTRA_SCORE = parseInt(process.env.SURGE_EXTRA_SCORE, 10) || 20;
 // Per-IP requests/min cap for whitelisted-by-UA-only crawlers (link-preview
-// bots, meta-webindexer): UA strings are trivially spoofable, so the uncapped
+// bots, DuckDuckBot): UA strings are trivially spoofable, so the uncapped
 // whitelist is reserved for rDNS-verified crawlers.
 const WHITELIST_BOT_CAP = parseInt(process.env.WHITELIST_BOT_CAP, 10) || 30;
 
@@ -156,9 +156,9 @@ function isStaticAsset(requestPath) {
 //   capped: true — UA-only whitelist with a WHITELIST_BOT_CAP/min per-IP
 //                  budget (429 above it). For preview bots that fetch a page
 //                  per human share, the cap is unreachable; for a scraper
-//                  hiding behind "WhatsApp" it's a ceiling. meta-webindexer
-//                  sits here on purpose: ASN-verified but capped — 8k+ pages
-//                  in 3 days is not link-preview behavior.
+//                  hiding behind "WhatsApp" it's a ceiling. (meta-webindexer
+//                  sat here capped until 2026-11-09; a per-IP cap does nothing
+//                  against a fleet of /24s, so it is now in BLOCKED_BOTS.)
 //   (neither)    — legacy unlimited UA-only pass. Reserved for Stripe
 //                  webhooks: capping those risks dropped payment events, a
 //                  far worse failure than tolerating a spoofable UA that was
@@ -200,9 +200,9 @@ const WHITELISTED_BOTS = [
 
   // Social media previews (important for link sharing/SEO) — fetch one page
   // per human share; the per-IP cap never touches that, only impersonators.
+  // Only Meta's LINK-PREVIEW fetcher is whitelisted. Its indexing/AI crawlers
+  // (meta-webindexer, meta-externalagent) are in BLOCKED_BOTS since 2026-11-09.
   { pattern: /facebookexternalhit/i, name: 'Facebook', asn: ASN_META, capped: true },
-  { pattern: /meta-externalagent/i, name: 'Meta (external agent)', asn: ASN_META, capped: true },
-  { pattern: /meta-webindexer/i, name: 'Meta (web indexer)', asn: ASN_META, capped: true },
   { pattern: /Twitterbot/i, name: 'Twitter/X', capped: true },
   { pattern: /LinkedInBot/i, name: 'LinkedIn', capped: true },
   { pattern: /WhatsApp/i, name: 'WhatsApp', capped: true },
@@ -538,6 +538,17 @@ const BLOCKED_BOTS = [
     { pattern: /SpiderLing/i, reason: 'NLP research crawler' },
     { pattern: /InternetMeasurement/i, reason: 'Internet scanner' },
     { pattern: /Palo Alto Networks/i, reason: 'Security scanner' },
+    // Meta's indexing / AI-training crawlers (2026-11-09). From 57.141.x they
+    // hit /{locale}/login, /feedback and social-login start ~2,500×/hour -
+    // pages with nothing to index (Sentry: GET login 291k/week). They used to
+    // be on the capped whitelist; a per-IP cap is no use against a fleet.
+    // NOT matched (on purpose): facebookexternalhit (link previews of shared
+    // results - whitelisted above), meta-externalfetcher (user-initiated
+    // fetches) and Facebot. Also disallowed in the app's robots.txt.
+    { pattern: /meta-webindexer/i, reason: 'Meta AI search indexer (meta-webindexer)' },
+    { pattern: /meta-externalagent/i, reason: 'Meta AI training crawler (meta-externalagent)' },
+    // ~100/hour from Google Cloud on noindex /{locale}/result/{uuid} pages.
+    { pattern: /ShapBot/i, reason: 'ShapBot crawler (noindex result pages)' },
 
     // =========================================================================
     // FAKE/IMPOSSIBLE BROWSER SIGNATURES

@@ -160,16 +160,38 @@ proof:
 - **rDNS** — `Googlebot`/`Bingbot`/`SeznamBot`/`YandexBot`/`Applebot`, forward
   confirmed and cached 48 h. DNS trouble fails **open**; a definitive mismatch
   falls through to the normal pipeline as a fake.
-- **ASN** — `facebookexternalhit`/`meta-externalagent`/`meta-webindexer`, by
+- **ASN** — `facebookexternalhit` (Meta's link-preview fetcher), by
   membership of AS32934 (`geodb/crawler-asn.bin`). Meta's fetchers have **no
   PTR records at all**, so the rDNS check could only ever call them fake — it
   did, for 50 583 requests in 48 h, which silently broke Facebook/WhatsApp
   link previews. Missing range data or an IPv6 client fails **open** to the
   capped UA-only path, never to fake.
 
-UA-only entries (other link-preview bots) and both verified Meta paths pass
+UA-only entries (other link-preview bots) and the verified Meta path pass
 under a `WHITELIST_BOT_CAP`/min per-IP budget. Stripe stays uncapped — webhook
 delivery must never break.
+
+### Blocked crawlers (by UA token, hard 403)
+
+Besides the SEO/AI scrapers in `BLOCKED_BOTS` (GPTBot, ClaudeBot, SemrushBot, …):
+
+- **`meta-webindexer`, `meta-externalagent`** (since 2026-11-09) — Meta's AI
+  search indexer and AI-training crawler. They were on the capped whitelist;
+  from Meta's 57.141.x range they made ~2,500 requests/hour to
+  `/{locale}/login`, `/feedback` and social-login start (pages with nothing to
+  index), and a per-IP cap is no use against a fleet of addresses. Blocked by
+  UA token alone, no IP verification needed: nobody is harmed if an impostor
+  claiming to be them is refused.
+- **`ShapBot`** (since 2026-11-09) — ~100/hour from Google Cloud on `noindex`
+  result-detail pages.
+
+**Not blocked, on purpose:** `facebookexternalhit` (Facebook/Messenger/
+WhatsApp/Instagram previews of shared results), `meta-externalfetcher`
+(user-initiated fetches), `Facebot`, and any browser UA from Meta's ranges
+without a crawler token — that goes through the normal pipeline like any
+datacenter visitor (no IP-range block). `/robots.txt` stays reachable for
+every blocked crawler (static path), and the app's `robots.txt` disallows the
+same three tokens.
 
 ## GeoDB (DB-IP)
 

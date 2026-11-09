@@ -181,8 +181,10 @@ test('Meta crawler inside AS32934 is allowed (no PTR required)', async () => {
   // proven by the beforeEach resolver that throws if consulted.
   const fb = await checkWhitelistedBot(FB_UA, '57.141.0.43');
   assert.deepStrictEqual(fb, { name: 'Facebook', allow: true });
+  // meta-webindexer is no longer whitelisted (blocked since 2026-11-09, see
+  // blocked-crawlers.test.js) - only the link-preview fetcher keeps its pass.
   const idx = await checkWhitelistedBot(META_INDEXER_UA, '57.141.0.44');
-  assert.deepStrictEqual(idx, { name: 'Meta (web indexer)', allow: true });
+  assert.strictEqual(idx, null);
 });
 
 test('Meta UA from outside AS32934 is a fake crawler', async () => {
