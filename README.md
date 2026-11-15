@@ -65,6 +65,7 @@ labels:
 | `BAN_DURATION` | `2592000000`           | Ban duration in ms (30 days) |
 | `CONTACT_EMAIL` | `j.mikes@me.com`       | Contact email on block pages |
 | `LOG_DIR` | `/var/log/bot-blocker` | Log directory |
+| `LOG_RETENTION_DAYS` | `14` | Days of `blocked-*.log` to keep (pruned after the daily summary and at start). Summaries are never removed. `0` = keep everything |
 | `TURNSTILE_SITE_KEY` | *(empty)* | Cloudflare Turnstile site key — challenge disabled while empty |
 | `TURNSTILE_SECRET_KEY` | *(empty)* | Turnstile secret key for siteverify |
 | `CHALLENGE_COOKIE_SECRET` | *(empty)* | HMAC secret signing the pass cookie |
@@ -238,10 +239,13 @@ Automatically bans IPs that access multiple locale paths rapidly (e.g., scraping
 
 ```
 /var/log/bot-blocker/
-├── blocked-2025-12-07.log    # Daily JSON logs
-├── summary-2025-12-06.txt    # Auto-generated summaries
+├── blocked-2025-12-07.log    # Daily JSON logs, kept LOG_RETENTION_DAYS (14) days
+├── summary-2025-12-06.txt    # Auto-generated summaries, kept forever
 └── banned-ips.json           # Persistent IP bans
 ```
+
+`GET /-/healthz` answers `200 ok` for a Docker healthcheck. It only answers a direct request:
+Traefik's forwardAuth always calls `/`, so it is not reachable through the edge.
 
 View logs:
 ```bash

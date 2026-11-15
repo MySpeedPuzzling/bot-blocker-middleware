@@ -12,6 +12,18 @@ const readline = require('readline');
 
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || 'j.mikes@me.com';
 const LOG_DIR = process.env.LOG_DIR || '/var/log/bot-blocker';
+// Days of `blocked-*.log` to keep. The sidecar writes one JSON line per decision
+// (50-170 MB a day under a swarm) and never used to prune: the volume reached
+// 5.5 GB / 119 files by 2026-11-15. The daily `summary-*.txt` files are ~2 KB
+// and ARE the long-term history, so they are never removed. 0 = keep everything.
+const LOG_RETENTION_DAYS = (() => {
+  const n = parseInt(process.env.LOG_RETENTION_DAYS, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 14;
+})();
+// Docker HEALTHCHECK target. Answered only on a DIRECT request: Traefik's
+// forwardAuth always calls `/` and carries the visitor's path in
+// X-Forwarded-Uri, so a visitor can neither reach nor spoof this through the edge.
+const HEALTH_PATH = '/-/healthz';
 const PORT = process.env.PORT || 3000;
 const RATE_LIMIT = parseInt(process.env.RATE_LIMIT, 10) || 45;
 const RATE_WINDOW = parseInt(process.env.RATE_WINDOW, 10) || 60 * 1000; // 1 minute
@@ -1199,6 +1211,38 @@ ${top.map(([ip, count]) => `  ${ip}: ${count}`).join('\n')}
   }
 }
 
+// Removes `blocked-YYYY-MM-DD.log` files older than the retention window.
+// The cutoff uses the date IN THE FILE NAME (UTC, the clock getLogFilePath()
+// writes with), not mtime, so a copied or restored volume ages correctly.
+// Async unlinks: the first run on an old volume frees gigabytes, and a sync
+// loop would stall every forwardAuth answer while it runs.
+async function pruneOldBlockLogs(now = Date.now(), retentionDays = LOG_RETENTION_DAYS) {
+  if (!retentionDays) return [];
+  const cutoff = new Date(now - retentionDays * 86400000).toISOString().split('T')[0];
+  let names;
+  try {
+    names = await fs.promises.readdir(LOG_DIR);
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
+  }
+  const removed = [];
+  for (const name of names) {
+    const match = /^blocked-(\d{4}-\d{2}-\d{2})\.log$/.exec(name);
+    if (!match || match[1] >= cutoff) continue;
+    try {
+      await fs.promises.unlink(path.join(LOG_DIR, name));
+      removed.push(name);
+    } catch (err) {
+      console.error(`[RETENTION] ${name}: ${err.message}`);
+    }
+  }
+  if (removed.length) {
+    console.log(`[RETENTION] Removed ${removed.length} block log(s) older than ${retentionDays} days`);
+  }
+  return removed;
+}
+
 function scheduleNextSummary() {
   const now = new Date();
   const tomorrow = new Date(now);
@@ -1210,7 +1254,13 @@ function scheduleNextSummary() {
   // generateDailySummary is async now; an unhandled rejection here would take
   // the whole process down on Node >=15, which is exactly the daily outage this
   // change exists to remove. Swallow at the boundary — it already logs.
-  const run = () => { generateDailySummary().catch(err => console.error(`[SUMMARY] ${err.message}`)); };
+  // Prune AFTER the summary, so yesterday's file is always summarised first.
+  const run = () => {
+    generateDailySummary()
+      .catch(err => console.error(`[SUMMARY] ${err.message}`))
+      .then(() => pruneOldBlockLogs())
+      .catch(err => console.error(`[RETENTION] ${err.message}`));
+  };
 
   setTimeout(() => {
     run();
@@ -2016,6 +2066,11 @@ function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
 // must degrade to "not blocking", never to "blocking everyone" — same
 // philosophy as the CrowdSec bouncer's fail-open on LAPI loss.
 const server = http.createServer((req, res) => {
+  if (req.url === HEALTH_PATH && !req.headers['x-forwarded-uri']) {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('ok');
+    return;
+  }
   handleRequest(req, res).catch((err) => {
     console.error(`[ERROR] handler failed open: ${err.stack || err.message}`);
     if (!res.headersSent) {
@@ -2391,9 +2446,10 @@ server.listen(PORT, () => {
   console.log(`Blocked bot patterns: ${BLOCKED_BOTS.length}`);
   console.log(`Blocked CIDR subnets: ${BLOCKED_CIDRS.length}`);
   console.log(`Static asset patterns: ${STATIC_ASSET_PATTERNS.length}`);
-  console.log(`Log directory: ${LOG_DIR}`);
+  console.log(`Log directory: ${LOG_DIR} (block logs kept ${LOG_RETENTION_DAYS || 'forever'}${LOG_RETENTION_DAYS ? ' days' : ''})`);
   console.log(`Contact email: ${CONTACT_EMAIL}`);
   scheduleNextSummary();
+  pruneOldBlockLogs().catch(err => console.error(`[RETENTION] ${err.message}`));
 });
 
 } // require.main guard
@@ -2430,6 +2486,9 @@ module.exports = {
   // Daily summary
   generateDailySummary,
   summaryReasonKey,
+  pruneOldBlockLogs,
+  LOG_RETENTION_DAYS,
+  HEALTH_PATH,
   // Visitor-facing pages
   renderPage,
   detectPageLocale,
