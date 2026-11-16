@@ -1180,6 +1180,17 @@ const SCORE_WEIGHTS = {
   no_accept_language: 20,      // browser-like UA without Accept-Language
   locale_lang_mismatch: 15,    // reads /ja/ but Accept-Language has no ja
   cookieless_deep_direct: 10,  // cookieless, referer-less entry straight to deep content
+  // D101 (2026-11-16) — both only for a COOKIELESS request (a returning visitor
+  // has cookies, a logged-in one is trusted before the ladder). Measured on the
+  // day's allow samples: the never-challenged swarm loading GA (residential
+  // IPs, "Mac Chrome", direct deep links to unprefixed Czech URLs) vs logged-in
+  // users: desktop Chrome < stable-9 in 95% vs 12%; unprefixed Czech URL with
+  // a browser language without cs/sk in 117/117 vs 10/15.
+  stale_browser: 20,           // desktop Chrome far behind the current stable
+  default_locale_lang_mismatch: 10, // unprefixed (Czech) deep URL, Accept-Language has no cs/sk.
+                               // 10, not 15: with cookieless_deep_direct alone (20 x 2.5 = 50)
+                               // a foreigner opening a shared Czech link is never challenged;
+                               // it takes stale_browser too.
   pass_exhausted: 25,          // HOSTING exit whose pass budget ran out (D96): with dc_asn = 65,
                                // a re-challenge at any pressure. Never added for residential
                                // IPs — live pressure is >=1.5 most of the time, so 25 x 2.4
@@ -1274,6 +1285,24 @@ function isAcceptBypass(headers, requestPath) {
   return Boolean(accept) && !accept.includes('text/html') && !accept.includes('*/*');
 }
 
+// Current Chrome stable is ESTIMATED from the calendar: Chrome 153 shipped
+// 2026-09-08 and Chrome releases every 2 weeks since. "Stale" = more than
+// STALE_CHROME_LAG majors behind (default 9 ≈ 4 months: enterprise-pinned
+// and long-unrestarted browsers stay inside it). STALE_CHROME_MIN_MAJOR pins
+// the cutoff by hand if Google changes the cadence.
+const STALE_CHROME_LAG = positiveIntEnv('STALE_CHROME_LAG', 9);
+function staleChromeCutoff(nowMs = Date.now()) {
+  const pinned = parseInt(process.env.STALE_CHROME_MIN_MAJOR, 10);
+  if (Number.isFinite(pinned) && pinned > 0) return pinned;
+  const est = 153 + Math.floor((nowMs - Date.UTC(2026, 8, 8)) / (14 * 24 * 3600 * 1000));
+  return est - STALE_CHROME_LAG;
+}
+// Chromium-based browsers whose Chrome/ token legitimately lags (Samsung
+// Internet, Opera, Yandex, UC, Vivaldi...) and every mobile UA are never
+// "stale": the signal is for desktop Chrome/Edge claims only.
+const STALE_EXEMPT_UA = /SamsungBrowser|OPR\/|OPiOS|YaBrowser|UCBrowser|Vivaldi|Electron|HuaweiBrowser|MiuiBrowser|CriOS|Android|Mobile/;
+const DESKTOP_UA = /Windows NT|Macintosh|X11; Linux|CrOS/;
+
 /**
  * Pure scoring function — rate5m is passed in (tests need determinism).
  * Returns { score, base, pressure, components }.
@@ -1337,6 +1366,19 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
   if (!hasCookies && !headers['referer']
     && requestPath.split('?')[0].split('/').filter(Boolean).length >= 2) {
     components.cookieless_deep_direct = SCORE_WEIGHTS.cookieless_deep_direct;
+  }
+
+  // --- D101: the never-challenged swarm (cookieless only) -----------------
+  if (!hasCookies) {
+    if (isChromiumClaim && DESKTOP_UA.test(ua) && !STALE_EXEMPT_UA.test(ua)
+      && chromeMajor > 0 && chromeMajor < staleChromeCutoff()) {
+      components.stale_browser = SCORE_WEIGHTS.stale_browser;
+    }
+    const bare = requestPath.split('?')[0];
+    if (!locale && bare.split('/').filter(Boolean).length >= 2 && acceptLanguage
+      && !/(^|[\s,;])(cs|sk)(-|;|,|$)/i.test(acceptLanguage)) {
+      components.default_locale_lang_mismatch = SCORE_WEIGHTS.default_locale_lang_mismatch;
+    }
   }
 
   // --- Pressure: auto-tighten under distributed crawl -----------------------
@@ -2935,6 +2977,7 @@ server.listen(PORT, () => {
 module.exports = {
   server,
   // D98 hardening + telemetry
+  staleChromeCutoff,
   isSafariFamilyUa,
   isAcceptBypass,
   isGoogleUserControlledOnly,
