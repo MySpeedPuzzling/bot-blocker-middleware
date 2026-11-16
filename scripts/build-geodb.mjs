@@ -79,7 +79,10 @@ const DC_KEYWORDS = [
   'kingsoft', 'ucloud', 'qiniu',
   // big hosting
   'ovh', 'hetzner', 'digitalocean', 'linode', 'akamai', 'vultr', 'choopa',
-  'contabo', 'leaseweb', 'ionos', '1&1', 'scaleway', 'online s.a.s', 'upcloud',
+  // ('1&1' was here until 2026-11-16: it matched "1&1 Versatel GmbH", a German
+  // residential/business ISP — real puzzlers. IONOS hosting is still caught
+  // by 'ionos'.)
+  'contabo', 'leaseweb', 'ionos', 'scaleway', 'online s.a.s', 'upcloud',
   'kamatera', 'hostinger', 'namecheap', 'godaddy', 'rackspace', 'softlayer',
   'ibm cloud', 'hivelocity', 'psychz', 'quadranet', 'colocrossing', 'serverius',
   'worldstream', 'greencloud', 'zenlayer', 'gcore', 'g-core', 'cdn77',
@@ -96,6 +99,43 @@ const DC_KEYWORDS = [
 function isDatacenterOrg(org) {
   const lower = org.toLowerCase();
   return DC_KEYWORDS.some(k => lower.includes(k));
+}
+
+// Hosting / ISP-proxy networks classified by ASN NUMBER, because their org
+// names carry no keyword. Each entry is evidence-backed (lily.srv D96): during
+// the 2026-11-13..15 wave these exits solved the Turnstile challenge at rates
+// no human population produces, one solve per IP, identical Linux Chrome.
+//   AS398781 OCULUS NETWORKS INC — ISP-proxy seller routed via Hurricane
+//            Electric (leased blocks incl. 40.223/16, 172.252/16); 2 979
+//            solver IPs in 3 days, ~50-70 % solve rate.
+//   AS62874  Web2Objects LLC, AS35916 MULTACOM CORPORATION — hosting/colo.
+//   AS209709 UAB code200 — proxy provider.
+const DC_ASNS = new Map([
+  ['398781', 'OCULUS NETWORKS INC'],
+  ['62874', 'Web2Objects LLC'],
+  ['35916', 'MULTACOM CORPORATION'],
+  ['209709', 'UAB code200'],
+]);
+
+// ASNs that are REAL consumer ISPs but also announce leased foreign blocks
+// that proxy sellers resell as "residential". Only the listed first octets
+// are classified; the ISP's own ranges stay untouched. AS22773 = Cox
+// Communications: genuine Cox lives in 24/68/70/72/98/174/184/…; the
+// AFRINIC /8s (and its 45.x blocks) announced under Cox produced 638 solver
+// IPs in 3 days, real Cox ranges ~20 (humans).
+const DC_ASN_OCTETS = new Map([
+  ['22773', { octets: new Set([41, 45, 102, 105, 154, 156, 196, 197]),
+    label: 'Cox-labelled leased block (ISP proxy)' }],
+]);
+
+// Datacenter label for an ASN range, or null for residential/unknown.
+function datacenterLabel(asn, org, start) {
+  if (DC_ASNS.has(asn)) return DC_ASNS.get(asn);
+  const byOctet = DC_ASN_OCTETS.get(asn);
+  if (byOctet) {
+    return byOctet.octets.has(start >>> 24) ? byOctet.label : null;
+  }
+  return org && isDatacenterOrg(org) ? org : null;
 }
 
 function ipToInt(ip) {
@@ -275,14 +315,15 @@ for (const line of asnCsv.split('\n')) {
   const org = f.slice(3).join(',').trim();  // org is the tail even if unquoted commas slipped through
   if (start === null || end === null) continue;
   let idx = 0xFFFF;
-  if (org && isDatacenterOrg(org)) {
-    idx = dcOrgIdx.get(org);
+  const dcLabel = datacenterLabel(f[2].trim(), org, start);
+  if (dcLabel) {
+    idx = dcOrgIdx.get(dcLabel);
     if (idx === undefined) {
       if (dcOrgs.length >= 0xFFFE) {
         idx = 0xFFFF;  // org table full — treat overflow as non-DC rather than corrupt
       } else {
-        idx = dcOrgs.push(org) - 1;
-        dcOrgIdx.set(org, idx);
+        idx = dcOrgs.push(dcLabel) - 1;
+        dcOrgIdx.set(dcLabel, idx);
       }
     }
     if (idx !== 0xFFFF) dcRangeCount++;

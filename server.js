@@ -44,7 +44,31 @@ const TURNSTILE_VERIFY_URL = process.env.TURNSTILE_VERIFY_URL || 'https://challe
 const CHALLENGE_COOKIE_SECRET = process.env.CHALLENGE_COOKIE_SECRET || '';
 const CHALLENGE_COOKIE_NAME = '__bb_pass';
 const CHALLENGE_TOKEN_PARAM = '__bb_token';
-const CHALLENGE_COOKIE_TTL_MS = (parseInt(process.env.CHALLENGE_COOKIE_TTL_DAYS, 10) || 7) * 24 * 60 * 60 * 1000;
+// Pass lifetime. 24 h since 2026-11-16 (lily.srv D96) — it was 7 days, and a
+// pass skips the whole risk ladder, so one paid Turnstile solve bought a
+// week-long crawl licence for that exit IP. CHALLENGE_COOKIE_TTL_HOURS wins;
+// the old CHALLENGE_COOKIE_TTL_DAYS is still honored when set.
+const CHALLENGE_COOKIE_TTL_MS = (() => {
+  const hours = parseInt(process.env.CHALLENGE_COOKIE_TTL_HOURS, 10);
+  if (Number.isFinite(hours) && hours > 0) return hours * 3600 * 1000;
+  const days = parseInt(process.env.CHALLENGE_COOKIE_TTL_DAYS, 10);
+  if (Number.isFinite(days) && days > 0) return days * 24 * 3600 * 1000;
+  return 24 * 3600 * 1000;
+})();
+// Hosting-class exits (datacenter/ISP-proxy ASN or curated cloud CIDR) get a
+// SHORT pass and a SMALL page budget: during the 2026-11-13..15 wave
+// DigitalOcean IPs solved the challenge ~94% of the time and ISP-proxy pools
+// ~50-70% (humans: ~1-2%). A solve now buys an hour / a few dozen pages, not a week.
+const HOSTING_PASS_TTL_MS = (parseInt(process.env.HOSTING_PASS_TTL_MIN, 10) || 60) * 60 * 1000;
+// Scorable (anonymous HTML GET) pages one pass covers before the ladder looks
+// again. Generous for residential visitors (a heavy anonymous reader stays far
+// below), tight for hosting exits. An exhausted pass adds `pass_exhausted`.
+const PASS_PAGE_BUDGET = parseInt(process.env.PASS_PAGE_BUDGET, 10) || 300;
+const HOSTING_PASS_PAGE_BUDGET = parseInt(process.env.HOSTING_PASS_PAGE_BUDGET, 10) || 30;
+// A pass whose remaining life exceeds its class TTL by more than this was
+// minted under older/looser rules (the 7-day passes, or a residential pass
+// presented from what is now a hosting IP) and is not honored.
+const PASS_TTL_SLACK_MS = 60 * 1000;
 const CHALLENGE_VERIFY_LIMIT = parseInt(process.env.CHALLENGE_VERIFY_LIMIT, 10) || 5; // siteverify attempts per IP per minute
 const CHALLENGE_ENABLED = process.env.CHALLENGE_ENABLED !== 'false'
   && TURNSTILE_SITE_KEY !== '' && TURNSTILE_SECRET_KEY !== '' && CHALLENGE_COOKIE_SECRET !== '';
@@ -88,6 +112,19 @@ const SURGE_EXTRA_SCORE = parseInt(process.env.SURGE_EXTRA_SCORE, 10) || 20;
 // bots, DuckDuckBot): UA strings are trivially spoofable, so the uncapped
 // whitelist is reserved for rDNS-verified crawlers.
 const WHITELIST_BOT_CAP = parseInt(process.env.WHITELIST_BOT_CAP, 10) || 30;
+// Fraction of ALLOWED requests written to the JSONL log as `allow_sample`
+// (2026-11-16, D96). Allowed traffic was invisible: a +85% day of 200s could
+// not be attributed to anyone. 0 disables; default 1%.
+const ALLOW_SAMPLE_RATE = (() => {
+  const r = parseFloat(process.env.ALLOW_SAMPLE_RATE);
+  return Number.isFinite(r) && r >= 0 && r <= 1 ? r : 0.01;
+})();
+// Response header on an ALLOW telling the app not to load Google Analytics
+// for this visitor (Traefik forwardAuth `authResponseHeaders` copies it onto
+// the upstream request and deletes any client-supplied copy). Set for
+// hosting-class exits without a trust cookie: no human audience browses from
+// a VM, and those are exactly the exits that solve the challenge for a living.
+const ANALYTICS_HEADER = 'X-BB-Analytics';
 
 // Locale scraping detection
 const LOCALE_THRESHOLD = parseInt(process.env.LOCALE_THRESHOLD, 10) || 4;       // unique locales
@@ -959,6 +996,8 @@ const SCORE_WEIGHTS = {
   no_accept_language: 20,      // browser-like UA without Accept-Language
   locale_lang_mismatch: 15,    // reads /ja/ but Accept-Language has no ja
   cookieless_deep_direct: 10,  // cookieless, referer-less entry straight to deep content
+  pass_exhausted: 25,          // valid pass whose page budget ran out (D96): with dc_asn = 65,
+                               // a re-challenge at any pressure; alone it never reaches 60
 };
 
 // REMOVED 2026-08-05: `cookieless_same_origin` (was 25). Measured against 48h of
@@ -1003,6 +1042,13 @@ function surgeTick() {
   return surgeBuckets.reduce((a, b) => a + b, 0);
 }
 
+// Current 5-min sum WITHOUT counting a request (allow sampling must not
+// inflate the pressure it reports). Stale buckets are not rotated here, so
+// right after a quiet gap this can overstate slightly — telemetry only.
+function surgePeek() {
+  return surgeBuckets.reduce((a, b) => a + b, 0);
+}
+
 /**
  * Is this request part of the scorable surface? HTML-rendering anonymous GETs
  * only — POSTs (webhooks, forms), API paths, health checks and non-HTML
@@ -1025,9 +1071,12 @@ function isScorableRequest(headers, requestPath) {
  * Pure scoring function — rate5m is passed in (tests need determinism).
  * Returns { score, base, pressure, components }.
  */
-function computeRiskScore(ip, userAgent, requestPath, headers, rate5m) {
+function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}) {
   const ua = userAgent || '';
   const components = {};
+  if (opts.passExhausted) {
+    components.pass_exhausted = SCORE_WEIGHTS.pass_exhausted;
+  }
 
   // --- IP reputation ---------------------------------------------------------
   const dcOrg = asnDatacenterOrg(ip);
@@ -1170,6 +1219,11 @@ async function generateDailySummary() {
         stats.malformed++;
         continue;
       }
+      if (entry.type === 'allow_sample') {
+        // Allowed traffic (ALLOW_SAMPLE_RATE sample) — not a block; counted apart.
+        stats.allowSampled = (stats.allowSampled || 0) + 1;
+        continue;
+      }
       stats.total++;
       stats.byType[entry.type] = (stats.byType[entry.type] || 0) + 1;
       const rk = summaryReasonKey(entry.reason);
@@ -1191,7 +1245,8 @@ async function generateDailySummary() {
 ================================
 
 Total Blocked Requests: ${stats.total}${stats.malformed ? `
-Malformed log lines skipped: ${stats.malformed}` : ''}
+Malformed log lines skipped: ${stats.malformed}` : ''}${stats.allowSampled ? `
+Allowed requests sampled (allow_sample, not counted above): ${stats.allowSampled}` : ''}
 
 By Type:
 ${byCount(stats.byType).map(([k, v]) => `  ${k}: ${v}`).join('\n')}
@@ -1523,6 +1578,11 @@ function isRateLimited(ip, userAgent) {
 setInterval(() => {
   const now = Date.now();
 
+  // Expired passes no longer need their page counters
+  for (const [key, rec] of passPages) {
+    if (now > rec.expiresMs) passPages.delete(key);
+  }
+
   // Clean rate limit records
   for (const [key, record] of requests) {
     if (now - record.windowStart > RATE_WINDOW * 2) {
@@ -1608,15 +1668,33 @@ function signPassCookie(ip, expiresMs) {
     .digest('hex');
 }
 
+// Hosting class: datacenter / ISP-proxy ASN (GeoDB, build-geodb.mjs) or a
+// curated cloud CIDR. Returns the network name, or null (residential/unknown).
+function hostingClass(ip) {
+  if (!ip) return null;
+  return asnDatacenterOrg(ip) || isCloudProviderIP(ip) || null;
+}
+
+function passTtlFor(ip) {
+  return hostingClass(ip) ? Math.min(HOSTING_PASS_TTL_MS, CHALLENGE_COOKIE_TTL_MS) : CHALLENGE_COOKIE_TTL_MS;
+}
+
 function makePassCookie(ip) {
-  const expiresMs = Date.now() + CHALLENGE_COOKIE_TTL_MS;
+  const ttlMs = passTtlFor(ip);
+  const expiresMs = Date.now() + ttlMs;
   const value = `${expiresMs}.${signPassCookie(ip, expiresMs)}`;
-  const maxAgeSec = Math.floor(CHALLENGE_COOKIE_TTL_MS / 1000);
+  const maxAgeSec = Math.floor(ttlMs / 1000);
   return `${CHALLENGE_COOKIE_NAME}=${value}; Max-Age=${maxAgeSec}; Path=/; Secure; HttpOnly; SameSite=Lax`;
 }
 
 function hasValidPassCookie(cookieHeader, ip) {
-  if (!cookieHeader) return false;
+  return readPassCookie(cookieHeader, ip) !== null;
+}
+
+// Validates the pass cookie; returns { key, expiresMs } or null. `key`
+// identifies this one pass (IP + its signed expiry) for the page budget.
+function readPassCookie(cookieHeader, ip) {
+  if (!cookieHeader) return null;
 
   // Minimal cookie-header parse — find our cookie among the others
   let raw = null;
@@ -1628,18 +1706,46 @@ function hasValidPassCookie(cookieHeader, ip) {
       break;
     }
   }
-  if (!raw) return false;
+  if (!raw) return null;
 
   const dot = raw.indexOf('.');
-  if (dot === -1) return false;
+  if (dot === -1) return null;
 
   const expiresMs = parseInt(raw.slice(0, dot), 10);
-  if (!Number.isFinite(expiresMs) || Date.now() > expiresMs) return false;
+  const now = Date.now();
+  if (!Number.isFinite(expiresMs) || now > expiresMs) return null;
+  // Longer-lived than this IP's class allows: minted under older rules.
+  if (expiresMs - now > passTtlFor(ip) + PASS_TTL_SLACK_MS) return null;
 
   const expected = signPassCookie(ip, expiresMs);
   const actual = raw.slice(dot + 1);
-  if (actual.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+  if (actual.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return null;
+  return { key: `${ip}|${expiresMs}`, expiresMs };
+}
+
+// Page budget per pass (in memory: a restart refills budgets, which only ever
+// errs toward the visitor). key -> { count, expiresMs, logged }.
+const passPages = new Map();
+
+// Counts one scorable page against the pass. Returns true while within
+// budget; on the first page over budget logs `pass_exhausted` once.
+function consumePassPage(pass, ip, userAgent, requestPath) {
+  let rec = passPages.get(pass.key);
+  if (!rec) {
+    rec = { count: 0, expiresMs: pass.expiresMs, logged: false };
+    passPages.set(pass.key, rec);
+  }
+  rec.count++;
+  const hosting = hostingClass(ip);
+  const budget = hosting ? HOSTING_PASS_PAGE_BUDGET : PASS_PAGE_BUDGET;
+  if (rec.count <= budget) return true;
+  if (!rec.logged) {
+    rec.logged = true;
+    logBlocked('pass_exhausted', ip, userAgent,
+      `Pass page budget (${budget}) used up`, requestPath, { budget, hosting: hosting || null });
+  }
+  return false;
 }
 
 // =============================================================================
@@ -2102,8 +2208,7 @@ async function handleRequest(req, res) {
   // pipeline below — no privileges, no instant block.
   const whitelisted = await checkWhitelistedBot(userAgent, ip);
   if (whitelisted && whitelisted.allow) {
-    res.writeHead(200);
-    res.end('OK');
+    allowRequest(res, 'crawler', ip, userAgent, requestPath, req.headers);
     return;
   }
 
@@ -2121,8 +2226,7 @@ async function handleRequest(req, res) {
       res.end(renderPage('ratelimit', { locale, ip }));
       return;
     }
-    res.writeHead(200);
-    res.end('OK');
+    allowRequest(res, 'google', ip, userAgent, requestPath, req.headers);
     return;
   }
 
@@ -2193,8 +2297,7 @@ async function handleRequest(req, res) {
   // the daily logs would expose a registered scraper account.
   const trustedUid = getTrustedUid(req.headers['cookie']);
   if (trustedUid) {
-    res.writeHead(200);
-    res.end('OK');
+    allowRequest(res, 'trust', ip, userAgent, requestPath, req.headers);
     return;
   }
 
@@ -2202,7 +2305,10 @@ async function handleRequest(req, res) {
   // (UA signatures, the 43/8 combo). Hard rules, rate limits and scrape
   // detection still apply to cookie holders. Permabans need no bypass —
   // solving the challenge lifted them.
-  const hasPass = CHALLENGE_ENABLED && hasValidPassCookie(req.headers['cookie'], ip);
+  // Hosting-class passes are short-lived (HOSTING_PASS_TTL_MS) and every pass
+  // carries a page budget, consumed in the ladder below (D96).
+  const pass = CHALLENGE_ENABLED ? readPassCookie(req.headers['cookie'], ip) : null;
+  const hasPass = pass !== null;
 
   // Check permanent ban
   if (isPermanentlyBanned(ip)) {
@@ -2386,12 +2492,21 @@ async function handleRequest(req, res) {
   // Risk-scoring ladder (D50) — the LAST gate, after every deterministic rule
   // passed. Scores the anonymous HTML surface; above the threshold it serves
   // the Turnstile challenge (managed mode: invisible to genuine browsers).
-  // Pass-cookie holders already proved humanity — never re-scored within the
-  // cookie's lifetime. In 'log' (shadow) mode nothing is ever acted on.
-  if (SCORING_MODE !== 'off' && !hasPass && isScorableRequest(req.headers, requestPath)
-      && !isScoringExemptPath(requestPath)) {
+  // A pass holder skips the ladder only while the pass's page budget lasts
+  // (D96): past it the request is scored again with `pass_exhausted` added,
+  // so a hosting exit (dc_asn 40 + 25) must solve again, while a residential
+  // reader (25 alone) is not challenged in calm traffic.
+  // In 'log' (shadow) mode nothing is ever acted on.
+  const scorable = SCORING_MODE !== 'off' && isScorableRequest(req.headers, requestPath)
+    && !isScoringExemptPath(requestPath);
+  let passExhausted = false;
+  if (scorable && hasPass) {
+    passExhausted = !consumePassPage(pass, ip, userAgent, requestPath);
+  }
+  let risk = null;
+  if (scorable && (!hasPass || passExhausted)) {
     const rate5m = surgeTick();
-    const risk = computeRiskScore(ip, userAgent, requestPath, req.headers, rate5m);
+    risk = computeRiskScore(ip, userAgent, requestPath, req.headers, rate5m, { passExhausted });
     if (risk.score >= SCORE_THRESHOLD) {
       const detail = `Risk score ${risk.score} (base ${risk.base} × pressure ${risk.pressure})`;
       // Challenge only when the challenge stack is live — a heuristic score
@@ -2410,8 +2525,59 @@ async function handleRequest(req, res) {
   }
 
   // Allow request
-  res.writeHead(200);
+  allowRequest(res, hasPass ? (passExhausted ? 'pass_exhausted' : 'pass') : 'clean',
+    ip, userAgent, requestPath, req.headers, { scorable, risk });
+}
+
+/**
+ * Answers 200 (allow). For hosting-class exits without a trust cookie it adds
+ * `X-BB-Analytics: off` (the app then skips Google Analytics); verified
+ * crawlers and trusted humans never get it. A random ALLOW_SAMPLE_RATE share
+ * of allows is logged as `allow_sample` — the only window onto allowed traffic.
+ */
+function allowRequest(res, via, ip, userAgent, requestPath, headers, info = {}) {
+  const hosting = (via === 'trust' || via === 'crawler' || via === 'google') ? null : hostingClass(ip);
+  if (hosting) {
+    res.writeHead(200, { [ANALYTICS_HEADER]: 'off' });
+  } else {
+    res.writeHead(200);
+  }
   res.end('OK');
+
+  if (ALLOW_SAMPLE_RATE > 0 && Math.random() < ALLOW_SAMPLE_RATE) {
+    try {
+      sampleAllow(via, ip, userAgent, requestPath, headers, hosting, info);
+    } catch (err) {
+      console.error(`[ALLOW_SAMPLE] ${err.message}`);
+    }
+  }
+}
+
+function sampleAllow(via, ip, userAgent, requestPath, headers, hosting, info) {
+  const scorable = info.scorable !== undefined
+    ? info.scorable
+    : (isScorableRequest(headers, requestPath) && !isScoringExemptPath(requestPath));
+  // Score what the ladder WOULD say, even for pass/trust holders (no surge tick).
+  const risk = info.risk || (scorable ? computeRiskScore(ip, userAgent, requestPath, headers, surgePeek()) : null);
+  let refererHost = null;
+  try { refererHost = headers['referer'] ? new URL(headers['referer']).host : null; } catch { refererHost = 'invalid'; }
+  logBlocked('allow_sample', ip, userAgent || '', `Allowed via ${via}`, requestPath, {
+    via,
+    hosting: hosting || hostingClass(ip) || null,
+    analytics_off: Boolean(hosting),
+    country: geoCountry(ip),
+    scorable,
+    score: risk ? risk.score : null,
+    components: risk ? risk.components : null,
+    method: (headers['x-forwarded-method'] || 'GET').toUpperCase(),
+    accept: (headers['accept'] || '').slice(0, 80),
+    accept_language: (headers['accept-language'] || '').slice(0, 40),
+    sec_fetch_site: headers['sec-fetch-site'] || null,
+    sec_fetch_dest: headers['sec-fetch-dest'] || null,
+    sec_ch_ua: Boolean(headers['sec-ch-ua']),
+    has_cookie: Boolean(headers['cookie']),
+    referer_host: refererHost,
+  });
 }
 
 // =============================================================================
@@ -2435,7 +2601,8 @@ if (GOOGLE_RANGES_REFRESH_HOURS > 0) {
 server.listen(PORT, () => {
   console.log(`Bot blocker middleware running on port ${PORT}`);
   console.log(`Rate limit: ${RATE_LIMIT} requests per ${RATE_WINDOW / 1000}s`);
-  console.log(`Challenge: ${CHALLENGE_ENABLED ? `ENABLED (cookie TTL ${CHALLENGE_COOKIE_TTL_MS / 86400000}d)` : 'disabled (missing TURNSTILE_SITE_KEY/TURNSTILE_SECRET_KEY/CHALLENGE_COOKIE_SECRET or CHALLENGE_ENABLED=false)'}`);
+  console.log(`Challenge: ${CHALLENGE_ENABLED ? `ENABLED (pass TTL ${CHALLENGE_COOKIE_TTL_MS / 3600000}h / ${PASS_PAGE_BUDGET} pages; hosting exits ${HOSTING_PASS_TTL_MS / 60000}min / ${HOSTING_PASS_PAGE_BUDGET} pages)` : 'disabled (missing TURNSTILE_SITE_KEY/TURNSTILE_SECRET_KEY/CHALLENGE_COOKIE_SECRET or CHALLENGE_ENABLED=false)'}`);
+  console.log(`Allow sampling: ${ALLOW_SAMPLE_RATE * 100}% of allowed requests logged as allow_sample`);
   console.log(`Trust cookie: ${TRUST_ENABLED ? `ENABLED (TTL ${TRUST_COOKIE_TTL_MS / 86400000}d)` : 'disabled (no TRUST_COOKIE_SECRET/CHALLENGE_COOKIE_SECRET)'}`);
   console.log(`Risk scoring: ${SCORING_MODE} (threshold ${SCORE_THRESHOLD}, baseline ${SURGE_BASELINE_5M}/5min, high-risk: ${[...HIGH_RISK_COUNTRIES].join(',') || 'none'})`);
   console.log(`Locale detection: ${LOCALE_THRESHOLD} locales with ${LOCALE_MIN_HITS}+ hits each in ${LOCALE_WINDOW / 1000}s triggers ${BAN_DURATION / (24 * 60 * 60 * 1000)}-day ban`);
@@ -2461,6 +2628,17 @@ module.exports = {
   buildRedirectUrl,
   makePassCookie,
   hasValidPassCookie,
+  readPassCookie,
+  consumePassPage,
+  hostingClass,
+  passTtlFor,
+  allowRequest,
+  ANALYTICS_HEADER,
+  ALLOW_SAMPLE_RATE,
+  CHALLENGE_COOKIE_TTL_MS,
+  HOSTING_PASS_TTL_MS,
+  PASS_PAGE_BUDGET,
+  HOSTING_PASS_PAGE_BUDGET,
   extractChallengeToken,
   verifyTurnstileToken,
   isVerifyRateLimited,
