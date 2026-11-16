@@ -129,3 +129,34 @@ test('reason and IP are HTML-escaped', () => {
   assert.doesNotMatch(html, /<img src=x/);
   assert.ok(html.includes('&lt;script&gt;'));
 });
+
+// -----------------------------------------------------------------------------
+// Challenge page: logged-in users are never challenged — the page says so and
+// links to /login (D96 follow-up). The login pages themselves are exempt from
+// the risk ladder so that link never leads into a second challenge.
+// -----------------------------------------------------------------------------
+
+test('challenge page tells visitors that logged-in puzzlers skip the check, in every locale', () => {
+  const { renderPage, PAGE_STRINGS } = require('../server.js');
+  for (const locale of Object.keys(PAGE_STRINGS)) {
+    const html = renderPage('challenge', { locale });
+    assert.ok(PAGE_STRINGS[locale].challengeLoginHint, `${locale} has a login hint`);
+    assert.ok(html.includes(PAGE_STRINGS[locale].challengeLoginHint), `${locale} renders it`);
+    assert.match(html, /<a id="bb-login" href="\/login">/);
+    assert.match(html, /\/login\?return=/, 'script points the link back at the wanted page');
+  }
+  // Only the challenge page carries it.
+  assert.ok(!renderPage('blocked', { locale: 'en' }).includes('bb-login'));
+  assert.ok(!renderPage('ratelimit', { locale: 'en' }).includes('bb-login'));
+});
+
+test('sign-in, registration, magic-link and social-login pages are exempt from the risk ladder', () => {
+  const { isScoringExemptPath } = require('../server.js');
+  for (const p of ['/login', '/en/login', '/de/login/', '/register', '/es/register', '/register/social',
+    '/en/login-link', '/login-link/sent', '/login/social/google', '/en/login/social/apple/callback?code=x']) {
+    assert.strictEqual(isScoringExemptPath(p), true, p);
+  }
+  for (const p of ['/en/loginx', '/en/result/login', '/en/puzzle/register', '/en/registration-stats', '/xx/login']) {
+    assert.strictEqual(isScoringExemptPath(p), false, p);
+  }
+});

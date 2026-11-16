@@ -540,11 +540,18 @@ const SCORING_EXEMPT_PATHS = new Set([
   '/ja/データ削除', '/fr/suppression-donnees', '/de/datenloeschung',
 ]);
 
+// Sign-in / registration / magic-link / social-login pages (any locale
+// prefix). They hold nothing worth scraping and they are the way to the
+// __bb_trust cookie: the challenge page itself tells people to log in, so the
+// login page must not challenge them again (D96 follow-up, 2026-11-16).
+// Deterministic rules and rate limits still apply; POSTs are never scored.
+const AUTH_PAGE_PATTERN = /^(?:\/(?:en|es|ja|fr|de|cs))?\/(?:login|register|login-link)(?:\/|$)/;
+
 function isScoringExemptPath(requestPath) {
   let p = String(requestPath || '/').split('?')[0].split('#')[0];
   try { p = decodeURIComponent(p); } catch { /* keep raw */ }
   if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
-  return SCORING_EXEMPT_PATHS.has(p);
+  return SCORING_EXEMPT_PATHS.has(p) || AUTH_PAGE_PATTERN.test(p);
 }
 
 // =============================================================================
@@ -1998,6 +2005,8 @@ body{
 h1{color:var(--ink);font-size:22px;font-weight:500;line-height:1.3;margin-bottom:12px}
 p{margin-bottom:16px}
 .widget{display:flex;justify-content:center;min-height:66px;margin:24px 0 8px}
+.login-hint{font-size:14px;margin:12px 0 0}
+.login-hint a{font-weight:600;white-space:nowrap}
 .foot{
   margin-top:24px;padding-top:20px;border-top:1px solid var(--line);
   font-size:13.5px;color:var(--muted);
@@ -2026,6 +2035,8 @@ summary:hover{color:var(--brand)}
 const PAGE_STRINGS = {
   en: {
     lang: 'en',
+    challengeLoginHint: 'Have an account? Logged-in puzzlers are recognised automatically and never see this check.',
+    challengeLoginCta: 'Log in',
     challengeTitle: 'Sorry to bother you!',
     challengeBody: 'We just need to make sure you are a real puzzler and not a bot. It takes a second &mdash; then you continue straight to the page you wanted.',
     rateTitle: 'Whoa, that was fast!',
@@ -2040,6 +2051,8 @@ const PAGE_STRINGS = {
   },
   cs: {
     lang: 'cs',
+    challengeLoginHint: 'M&aacute;š &uacute;&#269;et? P&#345;ihl&aacute;šen&eacute; puzzlisty pozn&aacute;me automaticky a tahle kontrola se jim nikdy nezobraz&iacute;.',
+    challengeLoginCta: 'P&#345;ihl&aacute;sit se',
     challengeTitle: 'Omlouv&aacute;me se za zdr&#382;en&iacute;!',
     challengeBody: 'Jen se ujist&iacute;me, &#382;e jsi skute&#269;n&yacute; puzzlista a ne robot. Zabere to chvilku &mdash; pak budeš pokra&#269;ovat rovnou na str&aacute;nku, kterou chceš.',
     rateTitle: 'Hola, to bylo rychl&eacute;!',
@@ -2054,6 +2067,8 @@ const PAGE_STRINGS = {
   },
   de: {
     lang: 'de',
+    challengeLoginHint: 'Du hast ein Konto? Angemeldete Puzzler erkennen wir automatisch &mdash; sie sehen diese Pr&uuml;fung nie.',
+    challengeLoginCta: 'Anmelden',
     challengeTitle: 'Entschuldige die St&ouml;rung!',
     challengeBody: 'Wir pr&uuml;fen nur kurz, ob du ein echter Puzzler bist und kein Bot. Das dauert einen Moment &mdash; danach geht es direkt weiter zu deiner Seite.',
     rateTitle: 'Oha, das ging schnell!',
@@ -2068,6 +2083,8 @@ const PAGE_STRINGS = {
   },
   es: {
     lang: 'es',
+    challengeLoginHint: '&iquest;Tienes cuenta? Reconocemos autom&aacute;ticamente a quien ha iniciado sesi&oacute;n y nunca ve esta comprobaci&oacute;n.',
+    challengeLoginCta: 'Iniciar sesi&oacute;n',
     challengeTitle: '&iexcl;Perdona la molestia!',
     challengeBody: 'Solo comprobamos que eres una persona y no un bot. Tarda un momento y despu&eacute;s sigues directo a la p&aacute;gina que quer&iacute;as.',
     rateTitle: '&iexcl;Vaya, qu&eacute; rapidez!',
@@ -2082,6 +2099,8 @@ const PAGE_STRINGS = {
   },
   fr: {
     lang: 'fr',
+    challengeLoginHint: 'Tu as un compte&nbsp;? Les puzzleurs connect&eacute;s sont reconnus automatiquement et ne voient jamais cette v&eacute;rification.',
+    challengeLoginCta: 'Se connecter',
     challengeTitle: 'D&eacute;sol&eacute; de te d&eacute;ranger&nbsp;!',
     challengeBody: 'On v&eacute;rifie simplement que tu es un vrai puzzleur et pas un robot. C&rsquo;est l&rsquo;affaire d&rsquo;un instant &mdash; ensuite tu continues vers ta page.',
     rateTitle: 'Oh l&agrave;, quelle vitesse&nbsp;!',
@@ -2096,6 +2115,8 @@ const PAGE_STRINGS = {
   },
   ja: {
     lang: 'ja',
+    challengeLoginHint: 'アカウントをお持ちですか？ログイン中のパズラーは自動的に認識され、この確認は表示されません。',
+    challengeLoginCta: 'ログイン',
     challengeTitle: 'お手数をおかけします！',
     challengeBody: 'ボットではなく本物のパズラーであることを確認しています。すぐに終わり、そのまま目的のページに進めます。',
     rateTitle: 'アクセスが少し速すぎるようです',
@@ -2139,10 +2160,14 @@ function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
   const title = kind === 'challenge' ? t.challengeTitle : kind === 'ratelimit' ? t.rateTitle : t.blockedTitle;
   const body = kind === 'challenge' ? t.challengeBody : kind === 'ratelimit' ? t.rateBody : t.blockedBody;
 
+  // Logged-in users carry the app-issued __bb_trust cookie and are never
+  // challenged — say so, with a way in. The script below points the link back
+  // at the page they wanted (/login?return=…; the app validates the target).
   const widget = kind === 'challenge' ? `
     <div class="widget">
       <div class="cf-turnstile" data-sitekey="${TURNSTILE_SITE_KEY}" data-callback="__bbSolved"></div>
-    </div>` : '';
+    </div>
+    <p class="login-hint">${t.challengeLoginHint} <a id="bb-login" href="/login">${t.challengeLoginCta}</a></p>` : '';
 
   // Reason AND client IP: everything a wrongly-blocked visitor needs to paste
   // into a support mail, so Jan can allowlist the exact address (D47 pattern).
@@ -2158,6 +2183,16 @@ function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
 
   const scripts = kind === 'challenge' ? `
   <script>
+    (function () {
+      try {
+        var url = new URL(window.location.href);
+        url.searchParams.delete('${CHALLENGE_TOKEN_PARAM}');
+        var back = url.pathname + url.search;
+        if (back.indexOf('/login') === -1) {
+          document.getElementById('bb-login').href = '/login?return=' + encodeURIComponent(back);
+        }
+      } catch (e) { /* plain /login link stays */ }
+    })();
     function __bbSolved(token) {
       try {
         var url = new URL(window.location.href);
