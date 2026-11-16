@@ -170,7 +170,8 @@ proof:
 
 UA-only entries (other link-preview bots) and the verified Meta path pass
 under a `WHITELIST_BOT_CAP`/min per-IP budget. Stripe stays uncapped — webhook
-delivery must never break.
+delivery must never break — but only for `POST /webhook/stripe` (D98). Apple's
+on-device link-preview fetcher (iMessage/Mail) is a capped 10/min allow.
 
 ### Blocked crawlers (by UA token, hard 403)
 

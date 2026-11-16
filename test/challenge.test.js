@@ -293,7 +293,7 @@ test('handler fails open (200) when internals throw', async () => {
         headers: {
           'x-forwarded-for': '198.51.100.77',
           'x-forwarded-uri': '/en/puzzle?__bb_token=boom',
-          'x-forwarded-user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/150.0.0.0',
+          'user-agent': 'Mozilla/5.0 (Windows NT 10.0) Chrome/150.0.0.0',
         },
       }, resolve).on('error', reject);
     });

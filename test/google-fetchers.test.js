@@ -57,7 +57,7 @@ function forward(ip, uri, ua) {
       headers: {
         'x-forwarded-for': ip,
         'x-forwarded-uri': uri,
-        'x-forwarded-user-agent': ua,
+        'user-agent': ua,
         'x-forwarded-method': 'GET',
         'accept': 'text/html',
         'accept-language': 'en',

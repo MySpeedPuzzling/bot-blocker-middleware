@@ -33,7 +33,7 @@ function forward(uri, ua) {
       headers: {
         'x-forwarded-for': '20.190.160.10', // an Azure address
         'x-forwarded-uri': uri,
-        'x-forwarded-user-agent': ua,
+        'user-agent': ua,
         'x-forwarded-method': 'GET',
         'x-original-protocol': 'HTTP/1.1',
         'accept': 'application/json',

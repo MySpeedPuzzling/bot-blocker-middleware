@@ -106,7 +106,7 @@ function forward(ip, uri, cookie) {
   const headers = {
     'x-forwarded-for': ip,
     'x-forwarded-uri': uri,
-    'x-forwarded-user-agent': CHROME_UA,
+    'user-agent': CHROME_UA,
     'x-forwarded-method': 'GET',
     'accept': 'text/html,application/xhtml+xml',
     'accept-language': 'en-US,en;q=0.9',

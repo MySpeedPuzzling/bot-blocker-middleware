@@ -120,6 +120,97 @@ const SURGE_EXTRA_SCORE = parseInt(process.env.SURGE_EXTRA_SCORE, 10) || 20;
 // bots, DuckDuckBot): UA strings are trivially spoofable, so the uncapped
 // whitelist is reserved for rDNS-verified crawlers.
 const WHITELIST_BOT_CAP = parseInt(process.env.WHITELIST_BOT_CAP, 10) || 30;
+
+// --- Hardening against deliberately forced fail-open (D98) -------------------
+// The gate in front (D97) answers 200 when we are down or slow, so crashing or
+// stalling this process is a bypass. UA length bounds regex time and Map key
+// size; every per-key Map is capped (oldest insertion evicted — Maps iterate
+// in insertion order, so this is O(1)).
+const MAX_UA_LENGTH = positiveIntEnv('MAX_UA_LENGTH', 512);
+const MAX_MAP_ENTRIES = positiveIntEnv('MAX_MAP_ENTRIES', 200000);
+
+function capMap(map, max) {
+  while (map.size > max) {
+    map.delete(map.keys().next().value);
+  }
+}
+
+// --- Log-only telemetry for the D98 rules that touch crawlers or traffic that
+// cannot solve a challenge. Every would-be decision is logged (not sampled),
+// once per rule+IP per WOULD_DEDUP_MS, as `would_cap` / `would_deny` /
+// `would_score` with extra.rule.
+const WOULD_DEDUP_MS = 10 * 60 * 1000;
+const wouldSeen = new Map();  // "rule|ip" -> ts
+
+function logWould(type, rule, ip, userAgent, requestPath, extra = {}) {
+  const key = rule + '|' + ip;
+  const now = Date.now();
+  const seen = wouldSeen.get(key);
+  if (seen && now - seen < WOULD_DEDUP_MS) return;
+  wouldSeen.set(key, now);
+  capMap(wouldSeen, MAX_MAP_ENTRIES);
+  logBlocked(type, ip, userAgent, `${rule}`, (requestPath || '').split('?')[0], { rule, ...extra });
+}
+
+function slash24(ip) {
+  if (!ip) return '';
+  if (ip.includes(':')) return ip.split(':').slice(0, 3).join(':') + '::/48';
+  return ip.split('.').slice(0, 3).join('.') + '.0/24';
+}
+
+// Spread of UA-only crawler names (Slurp, Qwant, link previews...) across /24s
+// per hour — a fleet borrowing "Slurp" shows up as a sudden spread. Logged
+// hourly as `crawler_spread`; alert-only, no limit (D98).
+const uaOnlySpread = new Map();  // name -> Set(/24)
+
+function recordUaOnlySpread(name, ip) {
+  let set = uaOnlySpread.get(name);
+  if (!set) {
+    set = new Set();
+    uaOnlySpread.set(name, set);
+  }
+  if (set.size < 50000) set.add(slash24(ip));
+}
+
+// Trust-cookie fan-out: distinct /24s per uid per hour. One account seen from
+// many networks is a shared scraper credential. Log-only for now (D98): no
+// uid was ever logged, so the threshold is set from this data, not guessed.
+const TRUST_FANOUT_LOG = positiveIntEnv('TRUST_FANOUT_LOG', 10);
+const trustFanout = new Map();  // uid -> Set(/24)
+
+function recordTrustFanout(uid, ip, userAgent, requestPath) {
+  let set = trustFanout.get(uid);
+  if (!set) {
+    set = new Set();
+    trustFanout.set(uid, set);
+    capMap(trustFanout, MAX_MAP_ENTRIES);
+  }
+  if (set.size > 1000) return;
+  const before = set.size;
+  set.add(slash24(ip));
+  if (set.size !== before && set.size === TRUST_FANOUT_LOG) {
+    logWould('would_deny', 'trust_fanout', uid, userAgent, requestPath, { uid, networks: set.size, ip });
+  }
+}
+
+setInterval(() => {
+  for (const [name, set] of uaOnlySpread) {
+    logBlocked('crawler_spread', '-', name, `${name}: ${set.size} distinct networks in the last hour`, '-',
+      { crawler: name, networks: set.size });
+  }
+  uaOnlySpread.clear();
+  for (const [uid, set] of trustFanout) {
+    if (set.size >= 3) {
+      logBlocked('trust_spread', '-', '-', `uid ${uid}: ${set.size} distinct networks in the last hour`, '-',
+        { uid, networks: set.size });
+    }
+  }
+  trustFanout.clear();
+  const now = Date.now();
+  for (const [key, ts] of wouldSeen) {
+    if (now - ts > WOULD_DEDUP_MS) wouldSeen.delete(key);
+  }
+}, 60 * 60 * 1000).unref();
 // Fraction of ALLOWED requests written to the JSONL log as `allow_sample`
 // (2026-11-16, D96). Allowed traffic was invisible: a +85% day of 200s could
 // not be attributed to anyone. 0 disables; default 1%.
@@ -269,8 +360,20 @@ const WHITELISTED_BOTS = [
 
   // Monitoring
   { pattern: /SentryUptimeBot/i, name: 'Sentry Uptime', capped: true },
-  { pattern: /Stripe\//i, name: 'Stripe' },  // uncapped: never risk webhook delivery
+  // Stripe webhooks: uncapped (never risk dropped payment events) but ONLY for
+  // a POST to the webhook route (D98). Until 2026-11-16 any method on any path
+  // passed with this UA — and the UA came from a client-settable header.
+  { pattern: /Stripe\//i, name: 'Stripe', methods: ['POST'], paths: ['/webhook/stripe'] },
 ];
+
+// Apple's on-device link-preview fetcher (iMessage, Mail, Notes) — a frozen
+// 2015 Safari UA with Meta/Twitter tokens appended. It runs on the sharer's
+// device (home ISPs, iCloud Private Relay), so the Meta ASN check below
+// labelled it "fake Facebook" and the ladder challenged ~39% of previews
+// (D98: 965 risk challenges / 910 Traefik 403s in a week). Exact match, low
+// per-IP cap: a preview is one fetch per share.
+const APPLE_LINK_PREVIEW_UA = /^Mozilla\/5\.0 \(Macintosh; Intel Mac OS X 10_11_1\) AppleWebKit\/601\.2\.4 \(KHTML, like Gecko\) Version\/9\.0\.1 Safari\/601\.2\.4 facebookexternalhit\/1\.1 Facebot Twitterbot\/1\.0$/;
+WHITELISTED_BOTS.unshift({ pattern: APPLE_LINK_PREVIEW_UA, name: 'Apple link preview', capped: true, cap: 10 });
 
 // ---------------------------------------------------------------------------
 // Forward-confirmed rDNS: PTR of the IP must end with an allowed suffix AND
@@ -286,10 +389,11 @@ const RDNS_FAKE_TTL_MS = 24 * 60 * 60 * 1000;
 let dnsReverse = (ip) => dns.promises.reverse(ip);
 let dnsResolve = (hostname) => dns.promises.resolve4(hostname);
 
-function _setDnsForTests(reverseFn, resolveFn) {
+function _setDnsForTests(reverseFn, resolveFn, clearLastOk = true) {
   dnsReverse = reverseFn;
   dnsResolve = resolveFn;
   rdnsCache.clear();
+  if (clearLastOk) rdnsLastOk.clear();
 }
 
 const rdnsCache = new Map();  // ip -> { state: 'ok'|'fake', exp }
@@ -320,32 +424,48 @@ async function verifyCrawlerRdns(ip, suffixes) {
       const addrs = await withTimeout(dnsResolve(host), RDNS_TIMEOUT_MS);
       state = (addrs || []).includes(ip) ? 'ok' : 'fake';
     }
+    if (state === 'ok') {
+      rdnsLastOk.set(ip, { host: host.toLowerCase(), exp: Date.now() + RDNS_LAST_OK_TTL_MS });
+      capMap(rdnsLastOk, MAX_MAP_ENTRIES);
+    }
   } catch (err) {
     // NXDOMAIN/no-PTR is a definitive answer — a real crawler always has one.
-    // Anything else (timeout, SERVFAIL) is OUR uncertainty: fail open, no cache.
+    // Anything else (timeout, SERVFAIL) is OUR uncertainty, no cache. An IP
+    // that verified within RDNS_LAST_OK_TTL_MS keeps its last 'ok' verdict, so
+    // a resolver hiccup never changes how a known crawler is treated (D98).
     if (err && (err.code === 'ENOTFOUND' || err.code === 'ENODATA')) {
       state = 'fake';
     } else {
+      const lastOk = rdnsLastOk.get(ip);
+      if (lastOk && lastOk.exp > Date.now()) return 'ok';
       return 'error';
     }
   }
 
   rdnsCache.set(ip, { state, exp: Date.now() + (state === 'ok' ? RDNS_OK_TTL_MS : RDNS_FAKE_TTL_MS) });
+  capMap(rdnsCache, MAX_MAP_ENTRIES);
   return state;
 }
 
+// Last forward-confirmed PTR per crawler IP (ip -> { host, exp }), kept far
+// longer than the verdict cache: survives DNS errors, and tells which suffix
+// verified the IP (telemetry for the `.google.com` Googlebot proof).
+const rdnsLastOk = new Map();
+const RDNS_LAST_OK_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 const crawlerBuckets = new Map();  // "name|ip" -> { count, windowStart }
 
-function isCrawlerCapped(name, ip) {
+function isCrawlerCapped(name, ip, cap = WHITELIST_BOT_CAP) {
   const key = name + '|' + ip;
   const now = Date.now();
   const record = crawlerBuckets.get(key);
   if (!record || now - record.windowStart > 60000) {
     crawlerBuckets.set(key, { count: 1, windowStart: now });
+    capMap(crawlerBuckets, MAX_MAP_ENTRIES);
     return false;
   }
   record.count++;
-  return record.count > WHITELIST_BOT_CAP;
+  return record.count > cap;
 }
 
 /**
@@ -358,14 +478,27 @@ function isCrawlerCapped(name, ip) {
  *                            human behind a weird UA string deserves the same
  *                            scoring/challenges as everyone else)
  */
-async function checkWhitelistedBot(userAgent, ip) {
+async function checkWhitelistedBot(userAgent, ip, method = 'GET', requestPath = '/') {
   if (!userAgent) return null;
   for (const entry of WHITELISTED_BOTS) {
     if (!entry.pattern.test(userAgent)) continue;
+    if (entry.methods && !entry.methods.includes(method)) continue;
+    if (entry.paths && !entry.paths.includes(requestPath.split('?')[0])) continue;
     if (entry.rdns) {
       const state = await verifyCrawlerRdns(ip, entry.rdns);
       if (state === 'fake') return { name: entry.name, fake: true };
-      // 'ok' → verified; 'error' → fail open (uncached, retried next request)
+      // 'ok' → verified; 'error' → still allowed today (uncached, retried next
+      // request) — logged so the D98 capped-allow can be judged on data.
+      if (state === 'error') {
+        logWould('would_cap', 'rdns_error_unverified', ip, userAgent, requestPath, { crawler: entry.name });
+      } else if (entry.rdns === RDNS_GOOGLE) {
+        // `.google.com` PTRs are Google's user-triggered fetcher mask, not
+        // Googlebot's (google-proxy-*.google.com). Log what still relies on it.
+        const host = rdnsLastOk.get(ip)?.host || '';
+        if (!host.endsWith('.googlebot.com') && !isGooglePublishedIp(ip)) {
+          logWould('would_deny', 'google_com_rdns_only', ip, userAgent, requestPath, { crawler: entry.name, ptr: host });
+        }
+      }
     }
     if (entry.asn) {
       // Only a LOADED range file can prove an impostor. With no data (missing
@@ -376,9 +509,10 @@ async function checkWhitelistedBot(userAgent, ip) {
         return { name: entry.name, fake: true };
       }
     }
-    if (entry.capped && isCrawlerCapped(entry.name, ip)) {
+    if (entry.capped && isCrawlerCapped(entry.name, ip, entry.cap || WHITELIST_BOT_CAP)) {
       return { name: entry.name, capped: true };
     }
+    if (!entry.rdns && !entry.asn && entry.capped) recordUaOnlySpread(entry.name, ip);
     return { name: entry.name, allow: true };
   }
   return null;
@@ -450,6 +584,21 @@ function rebuildGoogleBlockList() {
   }
   googleRanges.blockList = bl;
   googleRanges.count = count;
+  // Google's USER-CONTROLLED fetchers (Apps Script etc.) on their own (D98
+  // telemetry): an IP only in this list would be scored, not allowed.
+  const user = new net.BlockList();
+  const googleOwned = new net.BlockList();
+  for (const [name, cidrs] of Object.entries(googleRanges.lists)) {
+    const target = name === 'user-triggered-fetchers' ? user : googleOwned;
+    for (const cidr of cidrs) {
+      const [addr, bits] = cidr.split('/');
+      const type = net.isIPv6(addr) ? 'ipv6' : (net.isIPv4(addr) ? 'ipv4' : null);
+      if (!type) continue;
+      try { target.addSubnet(addr, parseInt(bits, 10), type); } catch { /* skip */ }
+    }
+  }
+  googleRanges.userControlled = user;
+  googleRanges.googleOwned = googleOwned;
 }
 
 // lists: { name: [cidr, ...] } — merges over what is loaded, so a list that
@@ -503,6 +652,15 @@ async function refreshGoogleRanges(fetchFn = fetch) {
 function normalizeClientIp(ip) {
   if (typeof ip !== 'string') return '';
   return ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip;
+}
+
+// True when the IP is ONLY in Google's user-controlled fetcher list.
+function isGoogleUserControlledOnly(ip) {
+  if (googleRanges.count === 0 || !googleRanges.userControlled) return false;
+  const addr = normalizeClientIp(ip);
+  const type = net.isIPv4(addr) ? 'ipv4' : (net.isIPv6(addr) ? 'ipv6' : null);
+  if (!type) return false;
+  return googleRanges.userControlled.check(addr, type) && !googleRanges.googleOwned.check(addr, type);
 }
 
 function isGooglePublishedIp(ip) {
@@ -1095,9 +1253,25 @@ function isScorableRequest(headers, requestPath) {
   if (requestPath.startsWith('/webhook')) return false;
   if (requestPath.startsWith('/-/')) return false;
   if (requestPath.startsWith('/.well-known/')) return false;
+  // Sitemaps (D98): an unverifiable engine (Brave) must never meet a challenge
+  // on the URL lists that drive indexing; they are public and cacheable anyway.
+  if (/^\/sitemap[^/]*\.xml(\?|$)/.test(requestPath)) return false;
   const accept = headers['accept'] || '';
   if (accept && !accept.includes('text/html') && !accept.includes('*/*')) return false;
   return true;
+}
+
+// Paths that legitimately answer non-HTML to GETs (D98). A GET elsewhere whose
+// Accept lacks text/html and */* skips the ladder today — logged as
+// `would_score` (rule non_html_accept) when the shadow score would challenge.
+const NON_HTML_PATH = /^\/(?:api\/|internal-api\/|webhook|-\/|\.well-known\/|_components\/|_wdt\/|sitemap|build\/|media\/|result-image\/)/;
+
+function isAcceptBypass(headers, requestPath) {
+  const method = (headers['x-forwarded-method'] || 'GET').toUpperCase();
+  if (method !== 'GET') return false;
+  if (NON_HTML_PATH.test(requestPath)) return false;
+  const accept = headers['accept'] || '';
+  return Boolean(accept) && !accept.includes('text/html') && !accept.includes('*/*');
 }
 
 /**
@@ -1112,7 +1286,13 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
   }
 
   // --- IP reputation ---------------------------------------------------------
-  const dcOrg = asnDatacenterOrg(ip);
+  // iCloud Private Relay egress is exempt for Safari-family UAs only (D98).
+  // D96 exempted it from hostingClass but this line kept the raw ASN check, so
+  // relay users still scored dc_asn +40 (243 Safari relay IPs challenged, 42%
+  // solved). Relay is Safari-only; the 636 non-Safari IPs on relay-listed
+  // ranges solved 4% — they keep the score until the list is audited.
+  const relayHuman = isSafariFamilyUa(ua) && isAppleRelay(ip);
+  const dcOrg = relayHuman ? null : asnDatacenterOrg(ip);
   if (dcOrg) {
     components.dc_asn = SCORE_WEIGHTS.dc_asn;
   } else if (isCloudProviderIP(ip)) {
@@ -1390,13 +1570,25 @@ function loadBannedIPs() {
   }
 }
 
+// Coalesced async write (D98): a burst of bans used to do one synchronous
+// pretty-printed JSON write per ban on the request path.
+let banSaveScheduled = false;
 function saveBannedIPs() {
-  try {
-    const data = Object.fromEntries(bannedIPs);
-    fs.writeFileSync(BANNED_IPS_FILE, JSON.stringify(data, null, 2));
-  } catch (err) {
-    console.error('[BAN] Failed to save banned IPs:', err.message);
-  }
+  if (banSaveScheduled) return;
+  banSaveScheduled = true;
+  setTimeout(() => {
+    banSaveScheduled = false;
+    let json;
+    try {
+      json = JSON.stringify(Object.fromEntries(bannedIPs));
+    } catch (err) {
+      console.error('[BAN] Failed to serialise banned IPs:', err.message);
+      return;
+    }
+    fs.writeFile(BANNED_IPS_FILE, json, (err) => {
+      if (err) console.error('[BAN] Failed to save banned IPs:', err.message);
+    });
+  }, 1000).unref();
 }
 
 function banIP(ip, reason, locales) {
@@ -1448,6 +1640,7 @@ function checkLocaleSwitch(ip, requestPath) {
     const localeCounts = new Map();
     localeCounts.set(locale, 1);
     localeTracker.set(ip, { localeCounts, windowStart: now });
+    capMap(localeTracker, MAX_MAP_ENTRIES);
     return false;
   }
 
@@ -1516,6 +1709,7 @@ function recordScrapeStrike(ip, reason) {
   const recentStrikes = strikes.filter(ts => now - ts < SCRAPE_STRIKE_WINDOW);
   recentStrikes.push(now);
   scrapeStrikes.set(ip, recentStrikes);
+  capMap(scrapeStrikes, MAX_MAP_ENTRIES);
 
   if (recentStrikes.length >= SCRAPE_STRIKES_FOR_BAN) {
     banIP(ip, reason, []);
@@ -1532,6 +1726,7 @@ function checkScrapeTracker(tracker, threshold, window, ip, userAgent, pageId, p
   if (!tracker.has(key)) {
     const uniqueIds = new Set([pageId]);
     tracker.set(key, { uniqueIds, windowStart: now });
+    capMap(tracker, MAX_MAP_ENTRIES);
     return null;
   }
 
@@ -1592,6 +1787,7 @@ function isRateLimited(ip, userAgent) {
 
   if (!requests.has(key)) {
     requests.set(key, { count: 1, windowStart: now });
+    capMap(requests, MAX_MAP_ENTRIES);
     return false;
   }
 
@@ -1711,6 +1907,13 @@ function hostingClass(ip) {
   return asnDatacenterOrg(ip) || isCloudProviderIP(ip) || null;
 }
 
+// Safari / iOS WebKit, excluding the Chromium/Firefox/Edge/Opera wrappers and
+// the Apple link-preview fetcher (which carries a 2015 Safari token).
+function isSafariFamilyUa(ua) {
+  if (!ua || !/AppleWebKit\//.test(ua) || !/(Version\/[\d.]+.*Safari\/|Mobile\/\w+)/.test(ua)) return false;
+  return !/(Chrome|Chromium|CriOS|FxiOS|EdgiOS|Edg\/|OPR\/|OPiOS|facebookexternalhit|bot|crawl)/i.test(ua);
+}
+
 function isAppleRelay(ip) {
   const ipInt = ipToInt(ip);
   if (ipInt === 0) return false;
@@ -1759,10 +1962,14 @@ function readPassCookie(cookieHeader, ip) {
   // Longer-lived than this IP's class allows: minted under older rules.
   if (expiresMs - now > passTtlFor(ip) + PASS_TTL_SLACK_MS) return null;
 
-  const expected = signPassCookie(ip, expiresMs);
   const actual = raw.slice(dot + 1);
-  if (actual.length !== expected.length) return null;
-  if (!crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected))) return null;
+  // Hex only, exact length — BEFORE timingSafeEqual. A JS-string length check
+  // let 64 multi-byte chars through; their UTF-8 buffers differ in length, the
+  // call threw, and the handler's catch-all answered 200 (D98: `/.env` came
+  // back 200 with a crafted cookie). Malformed = no pass, never an error.
+  if (!/^[0-9a-f]{64}$/.test(actual)) return null;
+  const expected = signPassCookie(ip, expiresMs);
+  if (!crypto.timingSafeEqual(Buffer.from(actual, 'hex'), Buffer.from(expected, 'hex'))) return null;
   return { key: `${ip}|${expiresMs}`, expiresMs };
 }
 
@@ -1777,6 +1984,7 @@ function consumePassPage(pass, ip, userAgent, requestPath) {
   if (!rec) {
     rec = { count: 0, expiresMs: pass.expiresMs, logged: false };
     passPages.set(pass.key, rec);
+    capMap(passPages, MAX_MAP_ENTRIES);
   }
   rec.count++;
   const hosting = hostingClass(ip);
@@ -1922,6 +2130,7 @@ function isVerifyRateLimited(ip) {
   const record = verifyAttempts.get(ip);
   if (!record || now - record.windowStart > 60000) {
     verifyAttempts.set(ip, { count: 1, windowStart: now });
+    capMap(verifyAttempts, MAX_MAP_ENTRIES);
     return false;
   }
   record.count++;
@@ -2257,7 +2466,13 @@ const server = http.createServer((req, res) => {
 });
 
 async function handleRequest(req, res) {
-  const userAgent = req.headers['x-forwarded-user-agent'] || req.headers['user-agent'] || '';
+  // Only the real User-Agent. `X-Forwarded-User-Agent` was read first until
+  // 2026-11-16 — nothing on the path sets it, so it was a client-chosen value
+  // (Traefik and the gate pass it through): "Chrome" to the app, "Stripe/1.0"
+  // to us. Truncated before any regex, Map key or log line (D98: an 8 KB UA
+  // made the blocked-bots scan ~4.6 ms and the rate-limit Map ~15 KB/entry).
+  const userAgent = (req.headers['user-agent'] || '').slice(0, MAX_UA_LENGTH);
+  const requestMethod = (req.headers['x-forwarded-method'] || 'GET').toUpperCase();
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress;
   const requestPath = req.headers['x-forwarded-uri'] || req.url || '/';
   const originalProtocol = req.headers['x-original-protocol'] || '';
@@ -2276,7 +2491,7 @@ async function handleRequest(req, res) {
   // crawlers pass unlimited; UA-only entries pass under a per-IP cap; refuted
   // impersonators ("Googlebot" from a Hetzner VM) fall through to the normal
   // pipeline below — no privileges, no instant block.
-  const whitelisted = await checkWhitelistedBot(userAgent, ip);
+  const whitelisted = await checkWhitelistedBot(userAgent, ip, requestMethod, requestPath);
   if (whitelisted && whitelisted.allow) {
     allowRequest(res, 'crawler', ip, userAgent, requestPath, req.headers);
     return;
@@ -2295,6 +2510,9 @@ async function handleRequest(req, res) {
       });
       res.end(renderPage('ratelimit', { locale, ip }));
       return;
+    }
+    if (isGoogleUserControlledOnly(ip)) {
+      logWould('would_score', 'google_user_triggered', ip, userAgent, requestPath);
     }
     allowRequest(res, 'google', ip, userAgent, requestPath, req.headers);
     return;
@@ -2367,7 +2585,8 @@ async function handleRequest(req, res) {
   // the daily logs would expose a registered scraper account.
   const trustedUid = getTrustedUid(req.headers['cookie']);
   if (trustedUid) {
-    allowRequest(res, 'trust', ip, userAgent, requestPath, req.headers);
+    recordTrustFanout(trustedUid, ip, userAgent, requestPath);
+    allowRequest(res, 'trust', ip, userAgent, requestPath, req.headers, { uid: trustedUid });
     return;
   }
 
@@ -2598,6 +2817,20 @@ async function handleRequest(req, res) {
     }
   }
 
+  // D98 telemetry: what the non-HTML-Accept skip lets through.
+  if (!scorable && SCORING_MODE !== 'off' && isAcceptBypass(req.headers, requestPath)
+    && !isScoringExemptPath(requestPath)) {
+    const shadow = computeRiskScore(ip, userAgent, requestPath, req.headers, surgePeek());
+    if (shadow.score >= SCORE_THRESHOLD) {
+      logWould('would_score', 'non_html_accept', ip, userAgent, requestPath, {
+        score: shadow.score, components: shadow.components, has_pass: hasPass,
+        accept: (req.headers['accept'] || '').slice(0, 80),
+        sec_fetch_dest: req.headers['sec-fetch-dest'] || null,
+        sec_fetch_mode: req.headers['sec-fetch-mode'] || null,
+      });
+    }
+  }
+
   // Allow request
   allowRequest(res, hasPass ? (passExhausted ? 'pass_exhausted' : 'pass') : 'clean',
     ip, userAgent, requestPath, req.headers, { scorable, risk });
@@ -2653,6 +2886,7 @@ function sampleAllow(via, ip, userAgent, requestPath, headers, hosting, info) {
     sec_ch_ua: Boolean(headers['sec-ch-ua']),
     has_cookie: Boolean(headers['cookie']),
     referer_host: refererHost,
+    uid: info.uid || null,
   });
 }
 
@@ -2700,6 +2934,16 @@ server.listen(PORT, () => {
 // Exported for unit tests only — the module never gets required in production.
 module.exports = {
   server,
+  // D98 hardening + telemetry
+  isSafariFamilyUa,
+  isAcceptBypass,
+  isGoogleUserControlledOnly,
+  capMap,
+  slash24,
+  recordTrustFanout,
+  APPLE_LINK_PREVIEW_UA,
+  MAX_UA_LENGTH,
+  MAX_MAP_ENTRIES,
   signPassCookie,
   buildRedirectUrl,
   makePassCookie,

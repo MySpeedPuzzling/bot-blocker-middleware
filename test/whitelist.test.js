@@ -121,11 +121,18 @@ test('UA-only preview bots pass under the per-IP cap, 429 above it', async () =>
   assert.deepStrictEqual(other, { name: 'WhatsApp', allow: true });
 });
 
-test('Stripe stays uncapped and unverified (webhook delivery must never break)', async () => {
+test('Stripe stays uncapped and unverified on POST /webhook/stripe (webhook delivery must never break)', async () => {
   for (let i = 0; i < WHITELIST_BOT_CAP * 2; i++) {
-    const result = await checkWhitelistedBot(STRIPE_UA, '203.0.113.60');
+    const result = await checkWhitelistedBot(STRIPE_UA, '203.0.113.60', 'POST', '/webhook/stripe');
     assert.deepStrictEqual(result, { name: 'Stripe', allow: true });
   }
+});
+
+test('D98: the Stripe UA claims nothing off the webhook route or on another method', async () => {
+  assert.strictEqual(await checkWhitelistedBot(STRIPE_UA, '203.0.113.61', 'GET', '/webhook/stripe'), null);
+  assert.strictEqual(await checkWhitelistedBot(STRIPE_UA, '203.0.113.61', 'GET', '/en/puzzle/abc'), null);
+  assert.strictEqual(await checkWhitelistedBot(STRIPE_UA, '203.0.113.61', 'POST', '/en/ladder'), null);
+  assert.strictEqual(await checkWhitelistedBot(STRIPE_UA, '203.0.113.61'), null);
 });
 
 test('non-crawler UA claims nothing', async () => {

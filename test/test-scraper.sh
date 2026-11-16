@@ -19,7 +19,7 @@ send_request() {
   local uri="$3"
   curl -s -o /dev/null -w "%{http_code}" \
     -H "X-Forwarded-For: $ip" \
-    -H "X-Forwarded-User-Agent: $ua" \
+    -H "User-Agent: $ua" \
     -H "X-Forwarded-URI: $uri" \
     "$URL"
 }

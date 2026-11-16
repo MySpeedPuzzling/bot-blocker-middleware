@@ -60,9 +60,12 @@ The middleware receives forwarded requests from Traefik and decides whether to a
 - `bannedIPs` Map - persisted permanent bans (loaded from `banned-ips.json`)
 - `localeTracker` Map - in-memory locale switching detection per IP
 
+**D98 hardening (2026-11-16, lily.srv D98).** The D97 nginx gate in front fails OPEN on connect error / 6 s timeout / 5xx, so a crash or stall here is a bypass: UAs are truncated to `MAX_UA_LENGTH` (512) before any regex/Map/log; every per-key Map is capped at `MAX_MAP_ENTRIES` (`capMap`, oldest evicted); cookie parsers never throw (`__bb_pass` signature must be 64 lowercase hex before `timingSafeEqual`); bans are written async + coalesced. Stripe's uncapped allow is only `POST /webhook/stripe`. Apple's on-device link-preview UA (2015 Safari + `facebookexternalhit`) is a capped (10/min) allow ahead of the Meta ASN check. `dc_asn` is not scored for Safari-family UAs on iCloud Private Relay egress. Sitemaps are never scored. Log-only telemetry (every decision, deduped per rule+IP per 10 min) as `would_cap`/`would_deny`/`would_score` with `extra.rule`: `rdns_error_unverified` (rDNS SERVFAIL/timeout for an IP that never verified — still allowed; an IP that verified within 7 days keeps its 'ok'), `google_com_rdns_only` (Googlebot UA verified only by a `.google.com` PTR, not in Google's lists), `google_user_triggered` (IP only in Google's user-controlled fetcher list), `non_html_accept` (a GET skipping the ladder via a non-HTML Accept that would have been challenged), `trust_fanout` (one trust uid on `TRUST_FANOUT_LOG`=10 /24s within the hour); hourly `crawler_spread` (UA-only crawler names by distinct /24) and `trust_spread` (uids on ≥3 /24s). `allow_sample` carries `uid` for trust allows. Enforcement of these waits for the data.
+
 **Traefik headers used:**
 - `X-Forwarded-For` - client IP
-- `X-Forwarded-User-Agent` - original user agent
+- `User-Agent` - the client's user agent (forwardAuth copies request headers). **Never** `X-Forwarded-User-Agent`: nothing on the path sets it, so it is client-chosen (D98).
+- `X-Forwarded-Method` - original method
 - `X-Forwarded-URI` - original request path
 - `X-Original-Protocol` - original HTTP protocol version (from Traefik plugin, e.g. `HTTP/2.0`)
 
