@@ -1187,6 +1187,11 @@ const SCORE_WEIGHTS = {
   // users: desktop Chrome < stable-9 in 95% vs 12%; unprefixed Czech URL with
   // a browser language without cs/sk in 117/117 vs 10/15.
   stale_browser: 20,           // desktop Chrome far behind the current stable
+  // D102 (2026-11-17): the solver fleet's own OS. "X11; Linux" desktop on a
+  // cookieless direct deep link: 1 of 466 logged-in samples vs 13 of 14
+  // never-challenged GA-loaders that hour. +10 alone never challenges
+  // (10+10 = 20 x 2.5 = 50); it takes a second signal.
+  linux_desktop_cookieless: 10,
   default_locale_lang_mismatch: 10, // unprefixed (Czech) deep URL, Accept-Language has no cs/sk.
                                // 10, not 15: with cookieless_deep_direct alone (20 x 2.5 = 50)
                                // a foreigner opening a shared Czech link is never challenged;
@@ -1373,6 +1378,9 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
     if (isChromiumClaim && DESKTOP_UA.test(ua) && !STALE_EXEMPT_UA.test(ua)
       && chromeMajor > 0 && chromeMajor < staleChromeCutoff()) {
       components.stale_browser = SCORE_WEIGHTS.stale_browser;
+    }
+    if (components.cookieless_deep_direct && /X11; Linux/.test(ua) && !/Android/.test(ua)) {
+      components.linux_desktop_cookieless = SCORE_WEIGHTS.linux_desktop_cookieless;
     }
     const bare = requestPath.split('?')[0];
     if (!locale && bare.split('/').filter(Boolean).length >= 2 && acceptLanguage

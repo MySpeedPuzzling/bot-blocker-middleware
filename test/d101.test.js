@@ -68,3 +68,21 @@ test('mobile and lagging Chromium browsers are never stale', () => {
     '/en/puzzle/abc', H({ 'sec-ch-ua-platform': '"Windows"' }), 0);
   assert.strictEqual(win.components.stale_browser, 20);
 });
+
+test('D102: Linux desktop on a cookieless direct deep link adds +10 — never enough alone', () => {
+  const linux = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
+  const h = H({ 'sec-ch-ua-platform': '"Linux"' });
+  // English page, English browser, pressure 2.0 (no surge component): 20 x 2 = 40 -> not challenged
+  const en = bb.computeRiskScore('198.51.100.1', linux, '/en/result/abc', h, 600);
+  assert.strictEqual(en.components.linux_desktop_cookieless, 10);
+  assert.ok(en.score < bb.SCORE_THRESHOLD, `score ${en.score}`);
+  // the GA-loading swarm shape: Czech URL, en-US -> 30 x 2 = 60
+  const cz = bb.computeRiskScore('198.51.100.1', linux, '/statistiky-hrace/abc', h, 600);
+  assert.ok(cz.score >= bb.SCORE_THRESHOLD, `score ${cz.score}`);
+  // with cookies, or a referer (not a direct deep entry): nothing
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', linux, '/statistiky-hrace/abc', H({ cookie: 'a=b' }), 0).components.linux_desktop_cookieless, undefined);
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', linux, '/statistiky-hrace/abc', H({ referer: 'https://myspeedpuzzling.com/' }), 0).components.linux_desktop_cookieless, undefined);
+  // Android carries "Linux" but never "X11; Linux"
+  const android = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36';
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', android, '/statistiky-hrace/abc', H(), 0).components.linux_desktop_cookieless, undefined);
+});
