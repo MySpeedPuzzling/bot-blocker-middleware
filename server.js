@@ -59,12 +59,20 @@ const CHALLENGE_COOKIE_TTL_MS = (() => {
 // SHORT pass and a SMALL page budget: during the 2026-11-13..15 wave
 // DigitalOcean IPs solved the challenge ~94% of the time and ISP-proxy pools
 // ~50-70% (humans: ~1-2%). A solve now buys an hour / a few dozen pages, not a week.
-const HOSTING_PASS_TTL_MS = (parseInt(process.env.HOSTING_PASS_TTL_MIN, 10) || 60) * 60 * 1000;
-// Scorable (anonymous HTML GET) pages one pass covers before the ladder looks
-// again. Generous for residential visitors (a heavy anonymous reader stays far
-// below), tight for hosting exits. An exhausted pass adds `pass_exhausted`.
-const PASS_PAGE_BUDGET = parseInt(process.env.PASS_PAGE_BUDGET, 10) || 300;
-const HOSTING_PASS_PAGE_BUDGET = parseInt(process.env.HOSTING_PASS_PAGE_BUDGET, 10) || 30;
+// Positive integer env, else the default (a negative TTL would mint passes
+// that are expired on arrival; 0/garbage falls back too).
+function positiveIntEnv(name, fallback) {
+  const n = parseInt(process.env[name], 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+const HOSTING_PASS_TTL_MS = positiveIntEnv('HOSTING_PASS_TTL_MIN', 60) * 60 * 1000;
+// Scorable requests (anonymous HTML-accepting GETs — page loads, but also lazy
+// turbo-frames and `Accept: */*` fetches, so ~3 per page view) one pass covers
+// before the ladder looks again. Generous for residential visitors; tight for
+// hosting exits (60 ≈ 20 page views), whose over-budget requests add
+// `pass_exhausted`. A residential pass past budget is simply scored again.
+const PASS_PAGE_BUDGET = positiveIntEnv('PASS_PAGE_BUDGET', 300);
+const HOSTING_PASS_PAGE_BUDGET = positiveIntEnv('HOSTING_PASS_PAGE_BUDGET', 60);
 // A pass whose remaining life exceeds its class TTL by more than this was
 // minted under older/looser rules (the 7-day passes, or a residential pass
 // presented from what is now a hosting IP) and is not honored.
@@ -873,6 +881,7 @@ function initGeoDb(dir) {
   geoDb.countryBuf = null;
   geoDb.asnBuf = null;
   geoDb.crawlerAsnBuf = null;
+  geoDb.relayBuf = null;
   geoDb.countries = [];
   geoDb.dcOrgs = [];
   geoDb.crawlerAsns = [];
@@ -905,6 +914,16 @@ function initGeoDb(dir) {
     geoDb.crawlerAsns = [];
     console.log(`[GEODB] Crawler-ASN ranges not available (${err.message}) — `
       + 'ASN-verified crawlers fall back to capped UA-only whitelist');
+  }
+
+  // Optional, fail-open: without it Private Relay users count as hosting
+  // (short pass, no GA) exactly as before the list existed.
+  try {
+    geoDb.relayBuf = fs.readFileSync(path.join(dir, 'apple-relay.bin'));
+    console.log(`[GEODB] Loaded ${geoDb.relayBuf.length / 8} Apple Private Relay ranges`);
+  } catch (err) {
+    geoDb.relayBuf = null;
+    console.log(`[GEODB] Apple Private Relay ranges not available (${err.message})`);
   }
   return true;
 }
@@ -996,8 +1015,10 @@ const SCORE_WEIGHTS = {
   no_accept_language: 20,      // browser-like UA without Accept-Language
   locale_lang_mismatch: 15,    // reads /ja/ but Accept-Language has no ja
   cookieless_deep_direct: 10,  // cookieless, referer-less entry straight to deep content
-  pass_exhausted: 25,          // valid pass whose page budget ran out (D96): with dc_asn = 65,
-                               // a re-challenge at any pressure; alone it never reaches 60
+  pass_exhausted: 25,          // HOSTING exit whose pass budget ran out (D96): with dc_asn = 65,
+                               // a re-challenge at any pressure. Never added for residential
+                               // IPs — live pressure is >=1.5 most of the time, so 25 x 2.4
+                               // would re-challenge heavy human readers.
 };
 
 // REMOVED 2026-08-05: `cookieless_same_origin` (was 25). Measured against 48h of
@@ -1029,7 +1050,7 @@ function uaOsFamily(ua) {
 const surgeBuckets = new Array(5).fill(0);
 let surgeMinute = Math.floor(Date.now() / 60000);
 
-function surgeTick() {
+function rotateSurge() {
   const minute = Math.floor(Date.now() / 60000);
   if (minute !== surgeMinute) {
     const gap = Math.min(5, minute - surgeMinute);
@@ -1038,14 +1059,19 @@ function surgeTick() {
     }
     surgeMinute = minute;
   }
+  return minute;
+}
+
+function surgeTick() {
+  const minute = rotateSurge();
   surgeBuckets[minute % 5]++;
   return surgeBuckets.reduce((a, b) => a + b, 0);
 }
 
-// Current 5-min sum WITHOUT counting a request (allow sampling must not
-// inflate the pressure it reports). Stale buckets are not rotated here, so
-// right after a quiet gap this can overstate slightly — telemetry only.
+// Current 5-min sum WITHOUT counting a request: over-budget pass holders and
+// allow sampling read the pressure but must not inflate it.
 function surgePeek() {
+  rotateSurge();
   return surgeBuckets.reduce((a, b) => a + b, 0);
 }
 
@@ -1672,7 +1698,16 @@ function signPassCookie(ip, expiresMs) {
 // curated cloud CIDR. Returns the network name, or null (residential/unknown).
 function hostingClass(ip) {
   if (!ip) return null;
+  // iCloud Private Relay egress is people in Safari, not crawlers, even though
+  // it leaves through Cloudflare/Akamai (datacenter by keyword).
+  if (isAppleRelay(ip)) return null;
   return asnDatacenterOrg(ip) || isCloudProviderIP(ip) || null;
+}
+
+function isAppleRelay(ip) {
+  const ipInt = ipToInt(ip);
+  if (ipInt === 0) return false;
+  return geoRangeLookup(geoDb.relayBuf, 8, ipInt) !== -1;
 }
 
 function passTtlFor(ip) {
@@ -2492,10 +2527,11 @@ async function handleRequest(req, res) {
   // Risk-scoring ladder (D50) — the LAST gate, after every deterministic rule
   // passed. Scores the anonymous HTML surface; above the threshold it serves
   // the Turnstile challenge (managed mode: invisible to genuine browsers).
-  // A pass holder skips the ladder only while the pass's page budget lasts
-  // (D96): past it the request is scored again with `pass_exhausted` added,
-  // so a hosting exit (dc_asn 40 + 25) must solve again, while a residential
-  // reader (25 alone) is not challenged in calm traffic.
+  // A pass holder skips the ladder only while the pass's budget lasts (D96):
+  // past it the request is scored again — a hosting exit with `pass_exhausted`
+  // added (dc_asn 40 + 25 = a new challenge at any pressure), a residential
+  // reader with no extra component (their cookie-carrying, coherent headers
+  // normally score ~0).
   // In 'log' (shadow) mode nothing is ever acted on.
   const scorable = SCORING_MODE !== 'off' && isScorableRequest(req.headers, requestPath)
     && !isScoringExemptPath(requestPath);
@@ -2505,8 +2541,11 @@ async function handleRequest(req, res) {
   }
   let risk = null;
   if (scorable && (!hasPass || passExhausted)) {
-    const rate5m = surgeTick();
-    risk = computeRiskScore(ip, userAgent, requestPath, req.headers, rate5m, { passExhausted });
+    // Pass holders never fed the pressure window before D96; over-budget ones
+    // must not start inflating it for everyone else — they read it only.
+    const rate5m = hasPass ? surgePeek() : surgeTick();
+    risk = computeRiskScore(ip, userAgent, requestPath, req.headers, rate5m,
+      { passExhausted: passExhausted && hostingClass(ip) !== null });
     if (risk.score >= SCORE_THRESHOLD) {
       const detail = `Risk score ${risk.score} (base ${risk.base} × pressure ${risk.pressure})`;
       // Challenge only when the challenge stack is live — a heuristic score
@@ -2561,7 +2600,9 @@ function sampleAllow(via, ip, userAgent, requestPath, headers, hosting, info) {
   const risk = info.risk || (scorable ? computeRiskScore(ip, userAgent, requestPath, headers, surgePeek()) : null);
   let refererHost = null;
   try { refererHost = headers['referer'] ? new URL(headers['referer']).host : null; } catch { refererHost = 'invalid'; }
-  logBlocked('allow_sample', ip, userAgent || '', `Allowed via ${via}`, requestPath, {
+  // Path WITHOUT the query string: logged-in users' URLs can carry reset /
+  // OAuth tokens, and the sample never needs them.
+  logBlocked('allow_sample', ip, userAgent || '', `Allowed via ${via}`, String(requestPath).split('?')[0], {
     via,
     hosting: hosting || hostingClass(ip) || null,
     analytics_off: Boolean(hosting),
@@ -2631,6 +2672,7 @@ module.exports = {
   readPassCookie,
   consumePassPage,
   hostingClass,
+  isAppleRelay,
   passTtlFor,
   allowRequest,
   ANALYTICS_HEADER,

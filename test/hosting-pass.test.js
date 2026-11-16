@@ -5,8 +5,10 @@
 // ~94% of the time, ISP-proxy pools ~50-70% (humans ~1-2%), and a solved pass
 // used to last 7 days while skipping the whole risk ladder. Now:
 //   - default pass TTL 24 h; hosting-class exits get 60 min
-//   - a pass covers PASS_PAGE_BUDGET (300) / HOSTING_PASS_PAGE_BUDGET (30)
-//     scorable pages; past it the request is scored with `pass_exhausted` (+25)
+//   - a pass covers PASS_PAGE_BUDGET (300) / HOSTING_PASS_PAGE_BUDGET (60)
+//     scorable requests; past it a hosting exit is scored with `pass_exhausted`
+//     (+25), a residential one is scored with no extra component
+//   - iCloud Private Relay egress is never hosting (Apple's list, baked at build)
 //   - passes living longer than their class allows (the old 7-day ones) are void
 //   - an allow for a hosting exit without a trust cookie carries
 //     `X-BB-Analytics: off` so the app skips Google Analytics
@@ -23,7 +25,9 @@ const http = require('node:http');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'bb-hosting-pass-'));
 
 // GeoDB fixture: 203.0.113.0/24 = a datacenter ASN ("TestHost"),
-// 198.51.100.0/24 = residential (no ASN record), both in the US.
+// 198.51.100.0/24 = residential (no ASN record), both in the US;
+// 203.0.113.192/26 is ALSO Apple Private Relay egress (a relay inside a DC ASN).
+const RELAY_IP = '203.0.113.200';
 const HOSTING_IP = '203.0.113.10';
 const HOSTING_IP_2 = '203.0.113.11';
 const HOME_IP = '198.51.100.20';
@@ -45,6 +49,10 @@ const HOME_IP_3 = '198.51.100.22';
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'country.bin'), country);
   fs.writeFileSync(path.join(dir, 'asn.bin'), asn);
+  const relay = Buffer.alloc(8);
+  relay.writeUInt32BE(ip(203, 0, 113, 192), 0);
+  relay.writeUInt32BE(ip(203, 0, 113, 255), 4);
+  fs.writeFileSync(path.join(dir, 'apple-relay.bin'), relay);
   fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify({
     built: 'test', countries: ['US'], dcOrgs: ['TestHost'],
   }));
@@ -196,20 +204,20 @@ test('pass_exhausted adds 25; with a datacenter ASN that crosses 60 at calm pres
 // End to end through the forwardAuth handler
 // -----------------------------------------------------------------------------
 
-test('hosting exit: 30 pages on a pass, then a fresh challenge (analytics off throughout)', async () => {
+test('hosting exit: budget requests on a pass, then a fresh challenge (analytics off throughout)', async () => {
   const cookie = passCookieValue(HOSTING_IP, Date.now() + 50 * 60 * 1000);
   for (let i = 1; i <= bb.HOSTING_PASS_PAGE_BUDGET; i++) {
     const res = await forward(HOSTING_IP, `/en/result/page-${i}`, cookie);
     assert.strictEqual(res.status, 200, `page ${i} should pass`);
     assert.strictEqual(res.analytics, 'off');
   }
-  const over = await forward(HOSTING_IP, '/en/result/page-31', cookie);
+  const over = await forward(HOSTING_IP, '/en/result/page-over', cookie);
   assert.strictEqual(over.status, 403);
   assert.strictEqual(over.reason, 'risk_score');
   await settle();
   const exhausted = logEntries().filter((e) => e.type === 'pass_exhausted' && e.ip === HOSTING_IP);
   assert.strictEqual(exhausted.length, 1);
-  assert.deepStrictEqual(exhausted[0].extra, { budget: 30, hosting: 'TestHost' });
+  assert.deepStrictEqual(exhausted[0].extra, { budget: bb.HOSTING_PASS_PAGE_BUDGET, hosting: 'TestHost' });
   const challenge = logEntries().filter((e) => e.type === 'risk_challenge' && e.ip === HOSTING_IP);
   assert.ok(challenge.at(-1).extra.components.pass_exhausted === 25);
 });
@@ -233,6 +241,19 @@ test('residential visitor past the 300-page budget is NOT challenged in calm tra
   }
   await settle();
   assert.strictEqual(logEntries().filter((e) => e.type === 'pass_exhausted' && e.ip === HOME_IP).length, 1);
+  // No pass_exhausted component for residential IPs, at any pressure: nothing
+  // was scored above zero for this coherent browser.
+  assert.strictEqual(logEntries().filter((e) => e.ip === HOME_IP && /^risk_/.test(e.type)).length, 0);
+});
+
+test('Private Relay egress inside a datacenter ASN is not hosting: normal pass, analytics kept', async () => {
+  assert.strictEqual(bb.isAppleRelay(RELAY_IP), true);
+  assert.strictEqual(bb.isAppleRelay(HOSTING_IP), false);
+  assert.strictEqual(bb.hostingClass(RELAY_IP), null);
+  assert.strictEqual(bb.passTtlFor(RELAY_IP), 24 * 3600 * 1000);
+  const res = await forward(RELAY_IP, '/en/ladder', 'other=1');
+  assert.strictEqual(res.status, 200);
+  assert.strictEqual(res.analytics, null);
 });
 
 test('hosting exit without a pass and clean headers: allowed at calm, analytics off', async () => {
@@ -258,7 +279,7 @@ test('a residential visitor never gets the analytics header', async () => {
 // -----------------------------------------------------------------------------
 
 test('allow_sample records via, hosting, score and header facts (no cookie values)', async () => {
-  await forward(HOME_IP_3, '/en/result/sampled', `${passCookieValue(HOME_IP_3, Date.now() + 3600 * 1000)}; secret=hunter2`);
+  await forward(HOME_IP_3, '/en/result/sampled?token=resetsecret', `${passCookieValue(HOME_IP_3, Date.now() + 3600 * 1000)}; secret=hunter2`);
   await settle();
   const s = logEntries().filter((e) => e.type === 'allow_sample' && e.ip === HOME_IP_3).at(-1);
   assert.ok(s, 'sample written');
@@ -271,6 +292,8 @@ test('allow_sample records via, hosting, score and header facts (no cookie value
   assert.strictEqual(s.extra.has_cookie, true);
   assert.strictEqual(s.extra.referer_host, 'myspeedpuzzling.com');
   assert.ok(!JSON.stringify(s).includes('hunter2'), 'cookie values never logged');
+  assert.strictEqual(s.path, '/en/result/sampled', 'query string stripped');
+  assert.ok(!JSON.stringify(s).includes('resetsecret'));
 });
 
 test('daily summary keeps allow_sample out of the blocked totals', async () => {

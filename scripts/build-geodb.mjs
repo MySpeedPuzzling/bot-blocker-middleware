@@ -374,6 +374,55 @@ crawlerRecords.forEach(([start, end, idx], i) => {
   crawlerBuf.writeUInt16BE(idx, i * 10 + 8);
 });
 
+// --- apple-relay.bin ---------------------------------------------------------
+// iCloud Private Relay egress (Apple's published list, IPv4 only). ~81 % of it
+// sits in Cloudflare/Akamai ASNs that the DC keywords classify as hosting, so
+// without this list anonymous Safari users on Private Relay would get the
+// short hosting pass and lose Google Analytics (D96). Records: u32 start,
+// u32 end (8 bytes), sorted, adjacent ranges merged. Fails open: no file =>
+// no exemption (server.js behaves exactly as before).
+const RELAY_URL = 'https://mask-api.icloud.com/egress-ip-ranges.csv';
+let relayRecords = [];
+if (process.env.SKIP_APPLE_RELAY) {
+  console.log('[geodb] SKIP_APPLE_RELAY set — apple-relay.bin not written');
+} else {
+  try {
+    const res = await fetch(RELAY_URL, { redirect: 'follow' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const raw = [];
+    for (const line of (await res.text()).split('\n')) {
+      const cidr = line.split(',')[0].trim();
+      if (!cidr || cidr.includes(':')) continue;
+      const range = cidrToRange(cidr);
+      if (range) raw.push(range);
+    }
+    raw.sort((a, b) => a[0] - b[0]);
+    for (const r of raw) {
+      const last = relayRecords[relayRecords.length - 1];
+      if (last && r[0] <= last[1] + 1) {
+        last[1] = Math.max(last[1], r[1]);
+      } else {
+        relayRecords.push([r[0], r[1]]);
+      }
+    }
+    // Apple publishes ~42k IPv4 prefixes (they merge to ~1k ranges); far fewer
+    // means a truncated or changed download.
+    if (raw.length < 10000) throw new Error(`only ${raw.length} prefixes — refusing a truncated list`);
+    console.log(`[geodb] Apple Private Relay: ${raw.length} IPv4 prefixes -> ${relayRecords.length} ranges`);
+  } catch (err) {
+    console.error(`[geodb] WARNING: Apple Private Relay list failed (${err.message}) — no relay exemption`);
+    relayRecords = [];
+  }
+}
+if (relayRecords.length > 0) {
+  const relayBuf = Buffer.alloc(relayRecords.length * 8);
+  relayRecords.forEach(([start, end], i) => {
+    relayBuf.writeUInt32BE(start, i * 8);
+    relayBuf.writeUInt32BE(end, i * 8 + 4);
+  });
+  writeFileSync(join(OUT_DIR, 'apple-relay.bin'), relayBuf);
+}
+
 // --- write -------------------------------------------------------------------
 writeFileSync(join(OUT_DIR, 'country.bin'), countryBuf);
 writeFileSync(join(OUT_DIR, 'asn.bin'), asnBuf);
@@ -385,6 +434,7 @@ writeFileSync(join(OUT_DIR, 'meta.json'), JSON.stringify({
   asnRanges: asnRecords.length,
   dcRanges: dcRangeCount,
   crawlerAsnRanges: crawlerRecords.length,
+  appleRelayRanges: relayRecords.length,
   countries,
   dcOrgs,
   crawlerAsns,
