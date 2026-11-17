@@ -1296,6 +1296,8 @@ function isAcceptBypass(headers, requestPath) {
 // and long-unrestarted browsers stay inside it). STALE_CHROME_MIN_MAJOR pins
 // the cutoff by hand if Google changes the cadence.
 const STALE_CHROME_LAG = positiveIntEnv('STALE_CHROME_LAG', 9);
+// D105 kill switch: DIRECT_ENTRY_CHALLENGE=0 turns the direct-entry floor off.
+const DIRECT_ENTRY_CHALLENGE = process.env.DIRECT_ENTRY_CHALLENGE !== '0';
 function staleChromeCutoff(nowMs = Date.now()) {
   const pinned = parseInt(process.env.STALE_CHROME_MIN_MAJOR, 10);
   if (Number.isFinite(pinned) && pinned > 0) return pinned;
@@ -1400,6 +1402,11 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
       && chromeMajor > 0 && chromeMajor < staleChromeCutoff()) || isStaleDesktopFirefox(ua)) {
       components.stale_browser = SCORE_WEIGHTS.stale_browser;
     }
+    // D105: a typed-in / app-opened deep link with no cookie at all. Marker
+    // (weight 0) — the floor below challenges it at any pressure.
+    if (components.cookieless_deep_direct && headers['sec-fetch-site'] === 'none') {
+      components.direct_entry = 0;
+    }
     if (components.cookieless_deep_direct && /X11; Linux/.test(ua) && !/Android/.test(ua)) {
       components.linux_desktop_cookieless = SCORE_WEIGHTS.linux_desktop_cookieless;
     }
@@ -1429,6 +1436,17 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
   if (components.stale_browser && components.cookieless_deep_direct && score < SCORE_THRESHOLD) {
     score = SCORE_THRESHOLD;
     floor = 'stale_cookieless_direct';
+  }
+  // D105 (2026-11-17): a cookieless, referer-less direct entry onto a deep
+  // page (sec-fetch-site: none) gets the managed challenge at any pressure.
+  // The residential swarm is exactly this — one such hit per fresh IP, no
+  // cookie ever (US/BR/PK, 91% en-US, never Portuguese from BR) — and it
+  // scored 0-50 unchallenged. Returning visitors (cookies), visitors from a
+  // search engine or another site (referer), in-site clicks, logged-in users
+  // and verified crawlers never reach this. Watched via direct_entry's solve rate.
+  if (components.direct_entry === 0 && score < SCORE_THRESHOLD && DIRECT_ENTRY_CHALLENGE) {
+    score = SCORE_THRESHOLD;
+    floor = floor || 'cookieless_direct_entry';
   }
 
   return { score, base, pressure: Math.round(pressure * 100) / 100, components, ...(floor ? { floor } : {}) };

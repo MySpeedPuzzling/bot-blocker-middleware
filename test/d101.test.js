@@ -29,7 +29,7 @@ test('stale cutoff follows the 2-week cadence from Chrome 153 (2026-09-08), lag 
 test('the swarm profile scores stale_browser + default_locale_lang_mismatch on top of cookieless_deep_direct', () => {
   const r = bb.computeRiskScore('198.51.100.1', mac(136), '/vysledek/01a1943e-9e7d-7118-b8b6-8e016ce5dbfc', H(), 450);
   assert.deepStrictEqual(Object.keys(r.components).sort(),
-    ['cookieless_deep_direct', 'default_locale_lang_mismatch', 'stale_browser']);
+    ['cookieless_deep_direct', 'default_locale_lang_mismatch', 'direct_entry', 'stale_browser']);
   assert.ok(r.score >= bb.SCORE_THRESHOLD, `score ${r.score}`);       // 40 x 1.5 = 60
 });
 
@@ -39,10 +39,13 @@ test('a returning visitor (cookies) never gets the new components', () => {
   assert.strictEqual(r.components.default_locale_lang_mismatch, undefined);
 });
 
-test('a current Chrome foreigner opening a shared Czech link is not challenged even at max pressure', () => {
-  const r = bb.computeRiskScore('198.51.100.1', mac(157), '/vysledek/abc', H(), 10000);
-  assert.strictEqual(r.components.stale_browser, undefined);
-  assert.ok(r.score < bb.SCORE_THRESHOLD, `score ${r.score}`);       // (10+10) x 2.5 = 50
+test('a current Chrome foreigner on a shared Czech link: scored 50 without D105; D105 challenges the cookieless direct entry, a referer clears it', () => {
+  const viaReferer = bb.computeRiskScore('198.51.100.1', mac(157), '/vysledek/abc',
+    H({ 'sec-fetch-site': 'cross-site', referer: 'https://l.facebook.com/' }), 10000);
+  assert.strictEqual(viaReferer.components.stale_browser, undefined);
+  assert.ok(viaReferer.score < bb.SCORE_THRESHOLD, `score ${viaReferer.score}`);
+  const typedIn = bb.computeRiskScore('198.51.100.1', mac(157), '/vysledek/abc', H(), 10000);
+  assert.strictEqual(typedIn.floor, 'cookieless_direct_entry');
 });
 
 test('Czech / Slovak browsers, prefixed URLs and the home page never get default_locale_lang_mismatch', () => {
@@ -71,7 +74,7 @@ test('mobile and lagging Chromium browsers are never stale', () => {
 
 test('D102: Linux desktop on a cookieless direct deep link adds +10 — never enough alone', () => {
   const linux = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
-  const h = H({ 'sec-ch-ua-platform': '"Linux"' });
+  const h = H({ 'sec-ch-ua-platform': '"Linux"', 'sec-fetch-site': 'cross-site' });   // keep D105 out
   // English page, English browser, pressure 2.0 (no surge component): 20 x 2 = 40 -> not challenged
   const en = bb.computeRiskScore('198.51.100.1', linux, '/en/result/abc', h, 600);
   assert.strictEqual(en.components.linux_desktop_cookieless, 10);
@@ -95,7 +98,8 @@ test('D103: stale desktop Chrome on a cookieless direct deep link is challenged 
   // no floor with a referer (not a direct entry) or with cookies, or for a current browser
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(136), '/en/result/abc', H({ referer: 'https://www.google.com/' }), 0).floor, undefined);
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(136), '/en/result/abc', H({ cookie: 'a=b' }), 0).floor, undefined);
-  assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(157), '/en/result/abc', H(), 0).floor, undefined);
+  // a current browser is not stale (a typed-in entry is still caught by D105, so test a cross-site one)
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(157), '/en/result/abc', H({ 'sec-fetch-site': 'cross-site' }), 0).floor, undefined);
 });
 
 test('D104: stale desktop Firefox counts as stale_browser; ESR, current and mobile Firefox do not', () => {
@@ -110,4 +114,25 @@ test('D104: stale desktop Firefox counts as stale_browser; ESR, current and mobi
   }
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', 'Mozilla/5.0 (Android 14; Mobile; rv:126.0) Gecko/126.0 Firefox/126.0', '/es/resultado/abc', h, 0).components.stale_browser, undefined);
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', ff(151, 'Windows NT 10.0; Win64; x64'), '/es/resultado/abc', h, 0).components.stale_browser, 20);
+});
+
+test('D105: a cookieless, referer-less direct entry onto a deep page is challenged at any pressure', () => {
+  const ua = mac(157);
+  const direct = bb.computeRiskScore('198.51.100.1', ua, '/en/result/abc', H({ 'sec-fetch-site': 'none' }), 0);
+  assert.strictEqual(direct.components.direct_entry, 0);
+  assert.strictEqual(direct.score, bb.SCORE_THRESHOLD);
+  assert.strictEqual(direct.floor, 'cookieless_direct_entry');
+  // not for: a cookie, a referer, an in-site navigation, the home page, a missing sec-fetch-site
+  for (const [path, extra] of [
+    ['/en/result/abc', { cookie: '_ga=GA1.1.1.1' }],
+    ['/en/result/abc', { referer: 'https://www.google.com/' }],
+    ['/en/result/abc', { 'sec-fetch-site': 'same-origin', referer: 'https://myspeedpuzzling.com/en' }],
+    ['/en/result/abc', { 'sec-fetch-site': 'cross-site', referer: 'https://www.facebook.com/' }],
+    ['/en', { 'sec-fetch-site': 'none' }],
+  ]) {
+    const r = bb.computeRiskScore('198.51.100.1', ua, path, H({ 'sec-fetch-site': 'none', ...extra }), 0);
+    assert.strictEqual(r.floor, undefined, `${path} ${JSON.stringify(extra)}`);
+  }
+  const noHeader = { 'accept-language': 'en-US', 'sec-ch-ua': '"x"', 'sec-ch-ua-platform': '"macOS"' };
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', ua, '/en/result/abc', noHeader, 0).floor, undefined);
 });

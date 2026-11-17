@@ -192,7 +192,8 @@ test('cookieless referer-less deep entry adds a weak signal', () => {
 // -----------------------------------------------------------------------------
 
 test('pressure multiplies the base and unlocks the surge signal', () => {
-  const headers = coherentHeaders({ 'accept-language': 'en-US,en;q=0.9' });
+  // cross-site (not a typed-in entry): keeps the D105 direct-entry floor out of the multiplier math
+  const headers = coherentHeaders({ 'accept-language': 'en-US,en;q=0.9', 'sec-fetch-site': 'cross-site' });
   delete headers['cookie'];
   // /ja/ + en-only AL + cookieless deep direct = 15 + 10 = 25 base at calm
   const calm = computeRiskScore('203.0.113.10', CHROME_UA, '/ja/puzzles/abc', headers, 300);
