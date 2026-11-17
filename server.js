@@ -1308,6 +1308,27 @@ function staleChromeCutoff(nowMs = Date.now()) {
 const STALE_EXEMPT_UA = /SamsungBrowser|OPR\/|OPiOS|YaBrowser|UCBrowser|Vivaldi|Electron|HuaweiBrowser|MiuiBrowser|CriOS|Android|Mobile/;
 const DESKTOP_UA = /Windows NT|Macintosh|X11; Linux|CrOS/;
 
+// D104 (2026-11-17): desktop Firefox too. The swarm moved from stale Chrome to
+// Firefox 151 within hours of D103; logged-in Firefox users run 158-160.
+// Firefox ships every 4 weeks; 160 is the anchor on 2026-11-10. Stale = more
+// than STALE_FIREFOX_LAG (5) majors behind, except the ESR lines enterprises
+// and Tor Browser pin (STALE_FIREFOX_ESR, default 115,128,140,153).
+const STALE_FIREFOX_LAG = positiveIntEnv('STALE_FIREFOX_LAG', 5);
+const STALE_FIREFOX_ESR = new Set(String(process.env.STALE_FIREFOX_ESR || '115,128,140,153')
+  .split(',').map((v) => parseInt(v, 10)).filter(Number.isFinite));
+function staleFirefoxCutoff(nowMs = Date.now()) {
+  const pinned = parseInt(process.env.STALE_FIREFOX_MIN_MAJOR, 10);
+  if (Number.isFinite(pinned) && pinned > 0) return pinned;
+  const est = 160 + Math.floor((nowMs - Date.UTC(2026, 10, 10)) / (28 * 24 * 3600 * 1000));
+  return est - STALE_FIREFOX_LAG;
+}
+function isStaleDesktopFirefox(ua) {
+  const m = /Firefox\/(\d+)\./.exec(ua);
+  if (!m || !DESKTOP_UA.test(ua) || /Android|Mobile|Tablet/.test(ua)) return false;
+  const major = parseInt(m[1], 10);
+  return major < staleFirefoxCutoff() && !STALE_FIREFOX_ESR.has(major);
+}
+
 /**
  * Pure scoring function — rate5m is passed in (tests need determinism).
  * Returns { score, base, pressure, components }.
@@ -1375,8 +1396,8 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
 
   // --- D101: the never-challenged swarm (cookieless only) -----------------
   if (!hasCookies) {
-    if (isChromiumClaim && DESKTOP_UA.test(ua) && !STALE_EXEMPT_UA.test(ua)
-      && chromeMajor > 0 && chromeMajor < staleChromeCutoff()) {
+    if ((isChromiumClaim && DESKTOP_UA.test(ua) && !STALE_EXEMPT_UA.test(ua)
+      && chromeMajor > 0 && chromeMajor < staleChromeCutoff()) || isStaleDesktopFirefox(ua)) {
       components.stale_browser = SCORE_WEIGHTS.stale_browser;
     }
     if (components.cookieless_deep_direct && /X11; Linux/.test(ua) && !/Android/.test(ua)) {
@@ -2996,6 +3017,7 @@ module.exports = {
   server,
   // D98 hardening + telemetry
   staleChromeCutoff,
+  staleFirefoxCutoff,
   isSafariFamilyUa,
   isAcceptBypass,
   isGoogleUserControlledOnly,

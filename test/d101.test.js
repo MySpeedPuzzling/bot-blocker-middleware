@@ -97,3 +97,17 @@ test('D103: stale desktop Chrome on a cookieless direct deep link is challenged 
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(136), '/en/result/abc', H({ cookie: 'a=b' }), 0).floor, undefined);
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(157), '/en/result/abc', H(), 0).floor, undefined);
 });
+
+test('D104: stale desktop Firefox counts as stale_browser; ESR, current and mobile Firefox do not', () => {
+  const ff = (v, os = 'Macintosh; Intel Mac OS X 10.15') => `Mozilla/5.0 (${os}; rv:${v}.0) Gecko/20100101 Firefox/${v}.0`;
+  assert.strictEqual(bb.staleFirefoxCutoff(Date.UTC(2026, 10, 17)), 155);
+  const h = { 'accept-language': 'en-US,en;q=0.5', 'sec-fetch-site': 'none' };
+  const old = bb.computeRiskScore('198.51.100.1', ff(151), '/es/resultado/abc', h, 0);
+  assert.strictEqual(old.components.stale_browser, 20);
+  assert.strictEqual(old.floor, 'stale_cookieless_direct');
+  for (const v of [160, 158, 140, 153]) {
+    assert.strictEqual(bb.computeRiskScore('198.51.100.1', ff(v), '/es/resultado/abc', h, 0).components.stale_browser, undefined, `Firefox ${v}`);
+  }
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', 'Mozilla/5.0 (Android 14; Mobile; rv:126.0) Gecko/126.0 Firefox/126.0', '/es/resultado/abc', h, 0).components.stale_browser, undefined);
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', ff(151, 'Windows NT 10.0; Win64; x64'), '/es/resultado/abc', h, 0).components.stale_browser, 20);
+});
