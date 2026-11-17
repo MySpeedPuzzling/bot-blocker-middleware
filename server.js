@@ -1398,9 +1398,19 @@ function computeRiskScore(ip, userAgent, requestPath, headers, rate5m, opts = {}
   let base = 0;
   for (const value of Object.values(components)) base += value;
   const multiplier = Math.min(2.5, Math.max(1, pressure));
-  const score = Math.round(base * multiplier);
+  let score = Math.round(base * multiplier);
 
-  return { score, base, pressure: Math.round(pressure * 100) / 100, components };
+  // D103 (2026-11-17): stale desktop Chrome on a cookieless direct deep link
+  // is challenged at ANY pressure. Since D101, 45 679 IPs were challenged with
+  // stale_browser and 4 solved (0.009%) — the signal reaches no humans, yet at
+  // night (pressure ~1.2) the swarm scored 38-58 and loaded GA.
+  let floor = null;
+  if (components.stale_browser && components.cookieless_deep_direct && score < SCORE_THRESHOLD) {
+    score = SCORE_THRESHOLD;
+    floor = 'stale_cookieless_direct';
+  }
+
+  return { score, base, pressure: Math.round(pressure * 100) / 100, components, ...(floor ? { floor } : {}) };
 }
 
 // =============================================================================

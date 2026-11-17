@@ -86,3 +86,14 @@ test('D102: Linux desktop on a cookieless direct deep link adds +10 — never en
   const android = 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Mobile Safari/537.36';
   assert.strictEqual(bb.computeRiskScore('198.51.100.1', android, '/statistiky-hrace/abc', H(), 0).components.linux_desktop_cookieless, undefined);
 });
+
+test('D103: stale desktop Chrome on a cookieless direct deep link is challenged at any pressure', () => {
+  const r = bb.computeRiskScore('198.51.100.1', mac(136), '/en/result/abc', H({ 'accept-language': 'en-US' }), 0);
+  assert.ok(r.components.stale_browser && r.components.cookieless_deep_direct);
+  assert.strictEqual(r.score, bb.SCORE_THRESHOLD);
+  assert.strictEqual(r.floor, 'stale_cookieless_direct');
+  // no floor with a referer (not a direct entry) or with cookies, or for a current browser
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(136), '/en/result/abc', H({ referer: 'https://www.google.com/' }), 0).floor, undefined);
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(136), '/en/result/abc', H({ cookie: 'a=b' }), 0).floor, undefined);
+  assert.strictEqual(bb.computeRiskScore('198.51.100.1', mac(157), '/en/result/abc', H(), 0).floor, undefined);
+});
