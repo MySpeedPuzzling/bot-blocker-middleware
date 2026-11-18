@@ -191,7 +191,101 @@ function recordTrustFanout(uid, ip, userAgent, requestPath) {
   if (set.size !== before && set.size === TRUST_FANOUT_LOG) {
     logWould('would_deny', 'trust_fanout', uid, userAgent, requestPath, { uid, networks: set.size, ip });
   }
+  if (set.size !== before && set.size === TRUST_FANOUT_REVOKE && TRUST_REVOKE_ENABLED) {
+    revokeTrust(uid, set.size, ip, userAgent, requestPath);
+  }
 }
+
+// D108 (2026-11-18): automatic loss of trust. One account seen on
+// TRUST_FANOUT_REVOKE distinct /24s within an hour is a shared or scripted
+// credential (logged-in humans peaked at 3 networks/hour, 2026-11-16..18; the
+// solver fleet changes IP on almost every page). Its __bb_trust cookie stops
+// bypassing anything for TRUST_REVOKE_HOURS: the browser is treated as
+// anonymous (challenge, or the login wall on a hosting exit). Persisted to
+// revoked-uids.json so a blue-green roll does not forgive it.
+const TRUST_REVOKE_ENABLED = process.env.TRUST_REVOKE !== '0';
+const TRUST_FANOUT_REVOKE = positiveIntEnv('TRUST_FANOUT_REVOKE', 15);
+const TRUST_REVOKE_MS = positiveIntEnv('TRUST_REVOKE_HOURS', 24) * 60 * 60 * 1000;
+const REVOKED_UIDS_FILE = path.join(LOG_DIR, 'revoked-uids.json');
+const revokedUids = new Map();  // uid -> { untilMs, networks, revokedAt }
+
+function revokeTrust(uid, networks, ip, userAgent, requestPath) {
+  revokedUids.set(uid, { untilMs: Date.now() + TRUST_REVOKE_MS, networks, revokedAt: new Date().toISOString() });
+  capMap(revokedUids, MAX_MAP_ENTRIES);
+  logBlocked('trust_revoked', ip, userAgent,
+    `uid ${uid}: ${networks} distinct networks within an hour - trust revoked for ${TRUST_REVOKE_MS / 3600000} h`,
+    requestPath, { uid, networks });
+  saveRevokedUids();
+}
+
+function isTrustRevoked(uid) {
+  const rec = revokedUids.get(uid);
+  if (!rec) return false;
+  if (Date.now() < rec.untilMs) return true;
+  revokedUids.delete(uid);
+  return false;
+}
+
+function loadRevokedUids() {
+  try {
+    if (!fs.existsSync(REVOKED_UIDS_FILE)) return;
+    const now = Date.now();
+    for (const [uid, rec] of Object.entries(JSON.parse(fs.readFileSync(REVOKED_UIDS_FILE, 'utf8')))) {
+      if (rec && rec.untilMs > now) revokedUids.set(uid, rec);
+    }
+    console.log(`[TRUST] Loaded ${revokedUids.size} active trust revocations`);
+  } catch (err) {
+    console.error('[TRUST] Failed to load revoked uids:', err.message);
+  }
+}
+
+let revokedSaveScheduled = false;
+function saveRevokedUids() {
+  if (revokedSaveScheduled) return;
+  revokedSaveScheduled = true;
+  setTimeout(() => {
+    revokedSaveScheduled = false;
+    fs.writeFile(REVOKED_UIDS_FILE, JSON.stringify(Object.fromEntries(revokedUids)), (err) => {
+      if (err) console.error('[TRUST] Failed to save revoked uids:', err.message);
+    });
+  }, 1000).unref();
+}
+
+// D108: manual account block list. blocked-uids.txt in LOG_DIR (the
+// bot-blocker-logs volume on the host), one uid per line, `#` comments. Find
+// an account's uid with substr(sha256(userIdentifier), 0, 16) - the app's
+// BotTrustCookieSigner::uidFor. A request carrying that account's trust
+// cookie gets a 403; without the cookie it is just an anonymous visitor.
+// Re-read when the file changes (checked every BLOCKED_UIDS_RELOAD_S), no roll.
+const BLOCKED_UIDS_FILE = path.join(LOG_DIR, 'blocked-uids.txt');
+let blockedUids = new Set();
+let blockedUidsMtime = -1;
+
+function reloadBlockedUids() {
+  let mtime = 0;
+  try {
+    mtime = fs.statSync(BLOCKED_UIDS_FILE).mtimeMs;
+  } catch {
+    mtime = 0;  // no file = empty list
+  }
+  if (mtime === blockedUidsMtime) return;
+  blockedUidsMtime = mtime;
+  const next = new Set();
+  if (mtime) {
+    try {
+      for (const line of fs.readFileSync(BLOCKED_UIDS_FILE, 'utf8').split('\n')) {
+        const uid = line.replace(/#.*/, '').trim();
+        if (/^[0-9a-f]{16}$/.test(uid)) next.add(uid);
+      }
+    } catch (err) {
+      console.error('[TRUST] Failed to read blocked uids:', err.message);
+      return;
+    }
+  }
+  blockedUids = next;
+  console.log(`[TRUST] Account block list: ${blockedUids.size} uid(s)`);
+}
+setInterval(reloadBlockedUids, positiveIntEnv('BLOCKED_UIDS_RELOAD_S', 60) * 1000).unref();
 
 setInterval(() => {
   for (const [name, set] of uaOnlySpread) {
@@ -2347,6 +2441,8 @@ summary:hover{color:var(--brand)}
 const PAGE_STRINGS = {
   en: {
     lang: 'en',
+    loginTitle: 'Please log in to continue',
+    loginBody: 'On this network we show results and statistics to logged-in puzzlers only &mdash; automated scrapers keep coming from it. Log in (or create a free account) and you continue straight to this page. Just registered? Confirm your e-mail first.',
     challengeLoginHint: 'Have an account? Logged-in puzzlers are recognised automatically and never see this check.',
     challengeLoginCta: 'Log in',
     challengeTitle: 'Sorry to bother you!',
@@ -2363,6 +2459,8 @@ const PAGE_STRINGS = {
   },
   cs: {
     lang: 'cs',
+    loginTitle: 'Pro pokra&#269;ov&aacute;n&iacute; se pros&iacute;m p&#345;ihlas',
+    loginBody: 'Z t&eacute;to s&iacute;t&#283; k n&aacute;m chod&iacute; automatick&eacute; stahov&aacute;n&iacute; dat, proto tu v&yacute;sledky a statistiky ukazujeme jen p&#345;ihl&aacute;šen&yacute;m puzzlist&#367;m. P&#345;ihlas se (nebo si zalo&#382; &uacute;&#269;et zdarma) a budeš pokra&#269;ovat rovnou na tuto str&aacute;nku. Pr&aacute;v&#283; ses registroval/a? Nejd&#345;&iacute;v potvr&#271; e-mail.',
     challengeLoginHint: 'M&aacute;š &uacute;&#269;et? P&#345;ihl&aacute;šen&eacute; puzzlisty pozn&aacute;me automaticky a tahle kontrola se jim nikdy nezobraz&iacute;.',
     challengeLoginCta: 'P&#345;ihl&aacute;sit se',
     challengeTitle: 'Omlouv&aacute;me se za zdr&#382;en&iacute;!',
@@ -2379,6 +2477,8 @@ const PAGE_STRINGS = {
   },
   de: {
     lang: 'de',
+    loginTitle: 'Bitte melde dich an, um fortzufahren',
+    loginBody: 'Aus diesem Netzwerk kommen automatisierte Scraper, deshalb zeigen wir Ergebnisse und Statistiken hier nur angemeldeten Puzzlern. Melde dich an (oder erstelle ein kostenloses Konto) und du landest direkt auf dieser Seite. Gerade registriert? Best&auml;tige zuerst deine E-Mail.',
     challengeLoginHint: 'Du hast ein Konto? Angemeldete Puzzler erkennen wir automatisch &mdash; sie sehen diese Pr&uuml;fung nie.',
     challengeLoginCta: 'Anmelden',
     challengeTitle: 'Entschuldige die St&ouml;rung!',
@@ -2395,6 +2495,8 @@ const PAGE_STRINGS = {
   },
   es: {
     lang: 'es',
+    loginTitle: 'Inicia sesi&oacute;n para continuar',
+    loginBody: 'Desde esta red nos llegan scrapers autom&aacute;ticos, as&iacute; que aqu&iacute; mostramos resultados y estad&iacute;sticas solo a quien ha iniciado sesi&oacute;n. Inicia sesi&oacute;n (o crea una cuenta gratis) y seguir&aacute;s directo a esta p&aacute;gina. &iquest;Acabas de registrarte? Confirma primero tu correo.',
     challengeLoginHint: '&iquest;Tienes cuenta? Reconocemos autom&aacute;ticamente a quien ha iniciado sesi&oacute;n y nunca ve esta comprobaci&oacute;n.',
     challengeLoginCta: 'Iniciar sesi&oacute;n',
     challengeTitle: '&iexcl;Perdona la molestia!',
@@ -2411,6 +2513,8 @@ const PAGE_STRINGS = {
   },
   fr: {
     lang: 'fr',
+    loginTitle: 'Connecte-toi pour continuer',
+    loginBody: 'Des robots d&rsquo;extraction automatique arrivent depuis ce r&eacute;seau, donc ici nous montrons les r&eacute;sultats et statistiques uniquement aux puzzleurs connect&eacute;s. Connecte-toi (ou cr&eacute;e un compte gratuit) et tu continues directement vers cette page. Tu viens de t&rsquo;inscrire&nbsp;? Confirme d&rsquo;abord ton e-mail.',
     challengeLoginHint: 'Tu as un compte&nbsp;? Les puzzleurs connect&eacute;s sont reconnus automatiquement et ne voient jamais cette v&eacute;rification.',
     challengeLoginCta: 'Se connecter',
     challengeTitle: 'D&eacute;sol&eacute; de te d&eacute;ranger&nbsp;!',
@@ -2427,6 +2531,8 @@ const PAGE_STRINGS = {
   },
   ja: {
     lang: 'ja',
+    loginTitle: '続けるにはログインしてください',
+    loginBody: 'このネットワークからは自動収集ボットのアクセスが続いているため、結果と統計はログイン中のパズラーにのみ表示しています。ログイン（または無料アカウントを作成）すると、このページにそのまま進めます。登録したばかりの方は、先にメールアドレスを確認してください。',
     challengeLoginHint: 'アカウントをお持ちですか？ログイン中のパズラーは自動的に認識され、この確認は表示されません。',
     challengeLoginCta: 'ログイン',
     challengeTitle: 'お手数をおかけします！',
@@ -2469,8 +2575,10 @@ function escapeHtml(value) {
  */
 function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
   const t = PAGE_STRINGS[locale] || PAGE_STRINGS.en;
-  const title = kind === 'challenge' ? t.challengeTitle : kind === 'ratelimit' ? t.rateTitle : t.blockedTitle;
-  const body = kind === 'challenge' ? t.challengeBody : kind === 'ratelimit' ? t.rateBody : t.blockedBody;
+  const title = kind === 'challenge' ? t.challengeTitle : kind === 'ratelimit' ? t.rateTitle
+    : kind === 'login' ? t.loginTitle : t.blockedTitle;
+  const body = kind === 'challenge' ? t.challengeBody : kind === 'ratelimit' ? t.rateBody
+    : kind === 'login' ? t.loginBody : t.blockedBody;
 
   // Logged-in users carry the app-issued __bb_trust cookie and are never
   // challenged — say so, with a way in. The script below points the link back
@@ -2479,7 +2587,9 @@ function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
     <div class="widget">
       <div class="cf-turnstile" data-sitekey="${TURNSTILE_SITE_KEY}" data-callback="__bbSolved"></div>
     </div>
-    <p class="login-hint">${t.challengeLoginHint} <a id="bb-login" href="/login">${t.challengeLoginCta}</a></p>` : '';
+    <p class="login-hint">${t.challengeLoginHint} <a id="bb-login" href="/login">${t.challengeLoginCta}</a></p>`
+    : kind === 'login' ? `
+    <p class="login-hint"><a id="bb-login" href="/login">${t.challengeLoginCta}</a></p>` : '';
 
   // Reason AND client IP: everything a wrongly-blocked visitor needs to paste
   // into a support mail, so Jan can allowlist the exact address (D47 pattern).
@@ -2493,7 +2603,7 @@ function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
       <div class="reason">${detailRows}</div>
     </details>` : '';
 
-  const scripts = kind === 'challenge' ? `
+  const returnScript = `
   <script>
     (function () {
       try {
@@ -2505,6 +2615,9 @@ function renderPage(kind, { reason = '', locale = 'en', ip = '' } = {}) {
         }
       } catch (e) { /* plain /login link stays */ }
     })();
+  </script>`;
+  const scripts = kind === 'login' ? returnScript : kind === 'challenge' ? `${returnScript}
+  <script>
     function __bbSolved(token) {
       try {
         var url = new URL(window.location.href);
@@ -2567,6 +2680,35 @@ const server = http.createServer((req, res) => {
     res.end('OK');
   });
 });
+
+// D108 (2026-11-18): login wall for the Turnstile-solving fleet. An anonymous
+// (no valid __bb_trust) Linux desktop browser on a hosting / proxy exit gets
+// the "please log in" page instead of a challenge it would pay to solve. Over
+// 24 h (2026-11-17/18) 1,218 of the 1,221 hosting-exit solvers were "X11;
+// Linux" Chrome on one-solve-per-IP proxies, and none of 1,638 logged-in
+// samples was a Linux desktop on a hosting network. Verified crawlers and
+// Google's ranges returned earlier; auth / legal pages, the homepages and
+// everything non-HTML stay open. Kill switch: LOGIN_WALL=0.
+const LOGIN_WALL_ENABLED = process.env.LOGIN_WALL !== '0';
+const LINUX_DESKTOP_UA = /X11; (?:Linux|Ubuntu|Fedora)/;
+
+function isLoginWallRequest(ip, userAgent, headers, requestPath) {
+  if (!LOGIN_WALL_ENABLED) return null;
+  if (!LINUX_DESKTOP_UA.test(userAgent) || /Android|CrOS/.test(userAgent)) return null;
+  if (!isScorableRequest(headers, requestPath) || isScoringExemptPath(requestPath)) return null;
+  const bare = requestPath.split('?')[0].split('#')[0];
+  if (/^\/(?:(?:en|cs|de|es|fr|ja)\/?)?$/.test(bare)) return null;  // homepages
+  return hostingClass(ip);
+}
+
+function serveLoginWall(res, locale, ip, hosting) {
+  res.writeHead(403, {
+    'Content-Type': 'text/html; charset=utf-8',
+    'Cache-Control': 'no-store',
+    'X-Blocked-Reason': 'login_wall',
+  });
+  res.end(renderPage('login', { reason: `Login required on this network (${hosting})`, locale, ip }));
+}
 
 async function handleRequest(req, res) {
   // Only the real User-Agent. `X-Forwarded-User-Agent` was read first until
@@ -2689,8 +2831,23 @@ async function handleRequest(req, res) {
   const trustedUid = getTrustedUid(req.headers['cookie']);
   if (trustedUid) {
     recordTrustFanout(trustedUid, ip, userAgent, requestPath);
-    allowRequest(res, 'trust', ip, userAgent, requestPath, req.headers, { uid: trustedUid });
-    return;
+    // D108: a blocked account is refused outright; a revoked one (fan-out)
+    // falls through and is handled like any anonymous visitor.
+    if (blockedUids.has(trustedUid)) {
+      logBlocked('uid_blocked', ip, userAgent, `Account ${trustedUid} is on the block list`, requestPath,
+        { uid: trustedUid });
+      res.writeHead(403, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'X-Blocked-Reason': 'uid_blocked',
+      });
+      res.end(renderPage('blocked', { reason: 'Account blocked', locale, ip }));
+      return;
+    }
+    if (!isTrustRevoked(trustedUid)) {
+      allowRequest(res, 'trust', ip, userAgent, requestPath, req.headers, { uid: trustedUid });
+      return;
+    }
   }
 
   // A valid pass cookie bypasses ONLY the challenge-eligible heuristics below
@@ -2881,6 +3038,16 @@ async function handleRequest(req, res) {
     return;
   }
 
+  // D108 login wall: before the ladder and regardless of a pass - a solved
+  // challenge is exactly what this fleet buys.
+  const wallHosting = isLoginWallRequest(ip, userAgent, req.headers, requestPath);
+  if (wallHosting) {
+    logBlocked('login_wall', ip, userAgent, `Anonymous Linux desktop on ${wallHosting}`, requestPath,
+      { hosting: wallHosting, has_pass: hasPass, revoked_uid: trustedUid || undefined });
+    serveLoginWall(res, locale, ip, wallHosting);
+    return;
+  }
+
   // Risk-scoring ladder (D50) — the LAST gate, after every deterministic rule
   // passed. Scores the anonymous HTML surface; above the threshold it serves
   // the Turnstile challenge (managed mode: invisible to genuine browsers).
@@ -3003,6 +3170,8 @@ if (require.main === module) {
 
 ensureLogDir();
 loadBannedIPs();
+loadRevokedUids();
+reloadBlockedUids();
 initGeoDb(GEODB_DIR);
 loadGoogleRanges(GEODB_DIR);
 if (GOOGLE_RANGES_REFRESH_HOURS > 0) {
@@ -3046,6 +3215,10 @@ module.exports = {
   capMap,
   slash24,
   recordTrustFanout,
+  isTrustRevoked,
+  reloadBlockedUids,
+  isLoginWallRequest,
+  TRUST_FANOUT_REVOKE,
   APPLE_LINK_PREVIEW_UA,
   MAX_UA_LENGTH,
   MAX_MAP_ENTRIES,
