@@ -771,6 +771,10 @@ const BLOCKED_BOTS = [
     { pattern: /meta-externalagent/i, reason: 'Meta AI training crawler (meta-externalagent)' },
     // ~100/hour from Google Cloud on noindex /{locale}/result/{uuid} pages.
     { pattern: /ShapBot/i, reason: 'ShapBot crawler (noindex result pages)' },
+    // ~5,700 pages/day (2026-11-17/18) from two Malaysian broadband IPs, no
+    // Accept-Language, no cookies, scored just under the challenge threshold.
+    // Not a search engine anyone documents; a bare self-declared indexer.
+    { pattern: /PageIndexer/i, reason: 'PageIndexer scraper (undocumented indexer)' },
 
     // =========================================================================
     // FAKE/IMPOSSIBLE BROWSER SIGNATURES

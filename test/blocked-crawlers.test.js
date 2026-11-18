@@ -62,6 +62,7 @@ const META_EXTERNALAGENT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.
   + '(compatible; meta-externalagent/1.1; +https://developers.facebook.com/docs/sharing/webmasters/web-crawlers)';
 const META_EXTERNALAGENT_BARE_UA = 'meta-externalagent/1.1 (+https://developers.facebook.com/docs/sharing/webmasters/crawler)';
 const META_WEBINDEXER_BARE_UA = 'meta-webindexer/1.1';
+const PAGEINDEXER_UA = 'Mozilla/5.0 (compatible; PageIndexer/1.0)';
 const SHAPBOT_UA = 'Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko); compatible; ShapBot/0.1.0';
 
 const FACEBOOK_PREVIEW_UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
@@ -123,6 +124,14 @@ test('ShapBot is blocked on result-detail pages', async () => {
   const res = await forward(GCP_IP, '/en/result/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', SHAPBOT_UA);
   assert.strictEqual(res.status, 403);
   assert.match(res.reason, /ShapBot/);
+});
+
+test('PageIndexer is blocked on puzzle and result pages from a residential IP', async () => {
+  for (const uri of ['/en/puzzle/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b', '/de/ergebnis/0190a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b']) {
+    const res = await forward('202.185.150.106', uri, PAGEINDEXER_UA);
+    assert.strictEqual(res.status, 403, `${uri} should be 403`);
+    assert.match(res.reason, /PageIndexer/);
+  }
 });
 
 test('ShapBot may still read robots.txt (static, never blocked)', async () => {
