@@ -154,7 +154,11 @@ test('login wall: logged-in (trust cookie) Linux on a hosting exit browses norma
 });
 
 test('login wall: login/register pages, homepages, robots.txt, API and POSTs stay open', async () => {
-  for (const uri of ['/en/login', '/login', '/en/register', '/', '/en', '/en/', '/robots.txt', '/sitemap.xml']) {
+  for (const uri of ['/en/login', '/login', '/en/register', '/', '/en', '/en/', '/robots.txt', '/sitemap.xml',
+    '/verify-email?token=abc', '/en/verify-email', '/password-reset', '/en/password-reset/abc123', '/password-reset/sent',
+    '/verify-code', '/resend-email-verification', '/set-password', '/login/social/google/callback?code=x',
+    '/connect/social/google/finish/tok', '/register/social/sign-in', '/login-link/check?x=1', '/oauth2/authorize?client_id=x',
+    '/logout']) {
     const res = await request(HOSTING_IP, uri);
     assert.notStrictEqual(res.reason, 'login_wall', uri);
   }

@@ -797,7 +797,11 @@ const SCORING_EXEMPT_PATHS = new Set([
 // __bb_trust cookie: the challenge page itself tells people to log in, so the
 // login page must not challenge them again (D96 follow-up, 2026-11-16).
 // Deterministic rules and rate limits still apply; POSTs are never scored.
-const AUTH_PAGE_PATTERN = /^(?:\/(?:en|es|ja|fr|de|cs))?\/(?:login|register|login-link)(?:\/|$)/;
+// D108 widened it to every step a not-yet-trusted person needs to reach the
+// trust cookie (e-mail verification, password reset, social sign-in finish,
+// OAuth consent): the login wall cannot be solved, so none of these may sit
+// behind it.
+const AUTH_PAGE_PATTERN = /^(?:\/(?:en|es|ja|fr|de|cs))?\/(?:login|register|login-link|logout|password-reset|verify-email|verify-code|resend-email-verification|set-password|connect\/social|oauth2\/authorize|account\/set-password|account\/social)(?:\/|$)/;
 
 function isScoringExemptPath(requestPath) {
   let p = String(requestPath || '/').split('?')[0].split('#')[0];
